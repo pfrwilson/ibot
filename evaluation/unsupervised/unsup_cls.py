@@ -19,6 +19,7 @@ from torchvision import transforms as pth_transforms
 from models.head import DINOHead
 from loader import ImageFolder
 
+
 def eval_pred(label, pred, calc_acc=False):
     nmi = metrics.normalized_mutual_info_score(label, pred)
     ari = metrics.adjusted_rand_score(label, pred)

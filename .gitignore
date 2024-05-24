@@ -11,3 +11,5 @@ __pycache__/
 pics/
 !.github/
 !.gitignore
+*.log
+scratch.*
