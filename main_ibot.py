@@ -13,6 +13,8 @@ import time
 import math
 import json
 import numpy as np
+from torch.optim import lr_scheduler
+from models.medsam import MedSAMIBot
 import utils
 import models
 import torch
@@ -30,279 +32,123 @@ from models.head import iBOTHead
 from loader import ImageFolderMask
 from evaluation.unsupervised.unsup_cls import eval_pred
 from timm.models import resnet
-import rich_argparse
+import rich
+from omegaconf import OmegaConf
 
 import dotenv
 
 dotenv.load_dotenv()
 
 
-@dataclass
-class AugmentationArgs: 
-    """Args for DataAugmentationIBot"""
-    global_crops_scale: tuple[float, float] = field(default_factory=lambda:(0.14, 1))
-    local_crops_scale: tuple[float, float] = field(default_factory=lambda:(0.05, 0.4))
-    global_crops_number: int = 2
-    local_crops_number: int = 0
-    global_crops_size: int = 224
-    local_crops_size: int = 96
-    jitter_prob: float = 0.8
-    mean: list[float] = field(default_factory=lambda:[0.485, 0.456, 0.406])
-    std: list[float] = field(default_factory=lambda:[0.229, 0.224, 0.225])
-    blur_prob_1: float = 1.0
-    blur_prob_2: float = 0.1
-    solarization_prob: float = 0.2
-    initial_crop_size: int = None
-    initial_resize_size: int = None
+def train_ibot(conf):
+    OmegaConf.save(conf, os.path.join(conf.output_dir, "config.yaml"), resolve=True)
 
+    utils.init_distributed_mode(conf)
+    utils.fix_random_seeds(conf.seed)
 
-@dataclass
-class Args:
-    """
-    Args for main training.
-
-    Args:
-        arch (str): Name of architecture to train. For quick experiments with ViTs,
-            we recommend using vit_tiny or vit_small.
-        patch_size (int): Size in pixels of input square patches - default 16 (for 16x16 patches). 
-            Using smaller values leads to better performance but requires more memory. 
-            Applies only for ViTs (vit_tiny, vit_small and vit_base). 
-            If <16, we recommend disabling mixed precision training (--use_fp16 false) to avoid unstabilities.
-        window_size (int): Size of window - default 7. This config is only valid for Swin Transofmer 
-            and is ignoired for vanilla ViT architectures.
-        out_dim (int): Dimensionality of output for [CLS] token.
-        patch_out_dim (int): Dimensionality of output for patch tokens.
-        shared_head (bool): Whether to share the same head for [CLS] token output and patch tokens output. 
-            When set to false, patch_out_dim is ignored and enforced to be same with out_dim. (Default: False)
-        shared_head_teacher (bool): See above. Only works for teacher model. (Defeault: True)
-        norm_last_layer (bool): Whether or not to weight normalize the last layer of the head.
-            Not normalizing leads to better performance but can make the training unstable.
-            In our experiments, we typically set this paramater to False with vit_small and True with vit_base.
-        momentum_teacher (float): Base EMA parameter for teacher update. The value is increased to 1 during 
-            training with cosine schedule. We recommend setting a higher value with small batches: 
-            for example use 0.9995 with batch size of 256.
-        norm_in_head (str): Whether to use batch normalizations in projection head (Default: None)
-        act_in_head (str): Whether to use batch normalizations in projection head (Default: gelu)
-        use_masked_im_modeling (bool): Whether to use masked image modeling (mim) in backbone (Default: True)
-        pred_ratio (float): Ratio of partial prediction. If a list of ratio is specified, 
-            one of them will be randomly choosed for each patch.
-        pred_ratio_var (float): Variance of partial prediction ratio. Length should be indentical 
-            to the length of pred_ratio. 0 for disabling.
-        pred_shape (str): Shape of partial prediction.
-        pred_start_epoch (int): Start epoch to perform masked image prediction. 
-            We typically set this to 50 for swin transformer. (Default: 0)
-        lambda1 (float): loss weight for dino loss over [CLS] tokens (Default: 1.0)
-        lambda2 (float): loss weight for beit loss over masked patch tokens (Default: 1.0)
-        warmup_teacher_temp (float): Initial value for the teacher temperature: 
-            0.04 works well in most cases. Try decreasing it if the training loss does not decrease.
-        teacher_temp (float): Final value (after linear warmup) of the teacher temperature. 
-            For most experiments, anything above 0.07 is unstable. We recommend starting with 
-            the default value of 0.04 and increase this slightly if needed.
-        warmup_teacher_patch_temp (float): See `--warmup_teacher_temp`
-        teacher_patch_temp (float): See `--teacher_temp`
-        warmup_teacher_temp_epochs (int): Number of warmup epochs for the teacher temperature (Default: 30).
-        use_fp16 (bool): Whether or not to use half precision for training. Improves training time and 
-            memory requirements, but can provoke instability and slight decay of performance. 
-            We recommend disabling mixed precision if the loss is unstable, 
-            if reducing the patch size or if training with bigger ViTs.
-        weight_decay (float): Initial value of the weight decay. With ViT, a smaller value at the 
-            beginning of training works well.
-        weight_decay_end (float): Final value of the weight decay. We use a cosine schedule for WD and 
-            using a larger decay by the end of training improves performance for ViTs.
-        clip_grad (float): Maximal parameter gradient norm if using gradient clipping. 
-            Clipping with norm .3 ~ 1.0 can help optimization for larger ViT architectures. 0 for disabling.
-        batch_size_per_gpu (int): Per-GPU batch-size : number of distinct images loaded on one GPU.
-        epochs (int): Number of epochs of training.
-        freeze_last_layer (int): Number of epochs during which we keep the output layer fixed. 
-            Typically doing so during the first epoch helps training. Try increasing this value 
-            if the loss does not decrease.
-        lr (float): Learning rate at the end of linear warmup (highest LR used during training). 
-            The learning rate is linearly scaled with the batch size, and specified here for a 
-            reference batch size of 256.
-        warmup_epochs (int): Number of epochs for the linear learning-rate warm up.
-        min_lr (float): Target LR at the end of optimization. We use a cosine LR schedule with linear warmup.
-        optimizer (str): Type of optimizer. We recommend using adamw with ViTs.
-        load_from (str): Path to load checkpoints to resume training.
-        load_model_from (str): Path to checkpoint to load *models* from. Unlike CKPT_PATH, only models 
-            would be loaded from here, not other run state.
-        drop_path (float): Drop path rate for student network.
-        data_path (str): Please specify path to the ImageNet training data.
-        output_dir (str): Path to save logs and checkpoints.
-        saveckp_freq (int): Save checkpoint every x epochs.
-        seed (int): Random seed.
-        num_workers (int): Number of data loading workers per GPU.
-        dist_url (str): url used to set up distributed training; see https://pytorch.org/docs/stable/distributed.html
-        local_rank (int): Please ignore and do not set this argument.
-        do_unsupervised_eval (bool): Whether to perform unsupervised evaluation, 
-            (clustering cls token -> image folder labels)
-        do_nct_probing (bool): Whether to perform probing on the NCT micro-ultrasound dataset
-        probing_freq (int): Probing frequency (do probing every N epochs)
-        wandb_run_id (str): WandB run ID
-    """
-    arch: str = 'vit_small'
-    patch_size: int = 16
-    window_size: int = 7
-    out_dim: int = 8192
-    patch_out_dim: int = 8192
-    shared_head: bool = False
-    shared_head_teacher: bool = True
-    norm_last_layer: bool = True
-    momentum_teacher: float = 0.996
-    norm_in_head: str = None
-    act_in_head: str = 'gelu'
-    use_masked_im_modeling: bool = True
-    pred_ratio: float = 0.3
-    pred_ratio_var: float = 0
-    pred_shape: str = 'block'
-    pred_start_epoch: int = 0
-    lambda1: float = 1.0
-    lambda2: float = 1.0
-    warmup_teacher_temp: float = 0.04
-    teacher_temp: float = 0.04
-    warmup_teacher_patch_temp: float = 0.04
-    teacher_patch_temp: float = 0.07
-    warmup_teacher_temp_epochs: int = 30
-    use_fp16: bool = True
-    weight_decay: float = 0.04
-    weight_decay_end: float = 0.4
-    clip_grad: float = 3.0
-    batch_size_per_gpu: int = 128
-    epochs: int = 100
-    freeze_last_layer: int = 1
-    lr: float = 0.0005
-    warmup_epochs: int = 10
-    min_lr: float = 1e-6
-    optimizer: str = 'adamw'
-    load_from: str = None
-    load_model_from: str = None
-    drop_path: float = 0.1
-    data_path: str = os.environ['DATA_PATH']
-    output_dir: str = "."
-    saveckp_freq: int = 40
-    seed: int = 0
-    num_workers: int = 10
-    dist_url: str = "env://"
-    local_rank: int = 0
-    do_unsupervised_eval: bool = False
-    do_nct_probing: bool = False
-    probing_freq: int = 1
-    wandb_run_id: str = None
-
-    data_augmentation: AugmentationArgs = field(default_factory=AugmentationArgs)
-
-
-def train_ibot(args: Args):
-    utils.init_distributed_mode(args)
-    utils.fix_random_seeds(args.seed)
-
-    print("git:\n  {}\n".format(utils.get_sha()))
-    print(
-        "\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items()))
-    )
+    print("===============")
+    print(OmegaConf.to_yaml(conf))
+    print("===============")
     cudnn.benchmark = True
 
     # ============ preparing data ... ============
     transform = DataAugmentationiBOT(
-        **asdict(args.data_augmentation),
+        **conf.transform,
     )
 
-    pred_size = args.patch_size * 8 if "swin" in args.arch else args.patch_size
+    pred_size = conf.patch_size * 8 if "swin" in conf.arch else conf.patch_size
     dataset = ImageFolderMask(
-        args.data_path,
+        conf.data_path,
         transform=transform,
         patch_size=pred_size,
-        pred_ratio=args.pred_ratio,
-        pred_ratio_var=args.pred_ratio_var,
+        pred_ratio=conf.pred_ratio,
+        pred_ratio_var=conf.pred_ratio_var,
         pred_aspect_ratio=(0.3, 1 / 0.3),
-        pred_shape=args.pred_shape,
-        pred_start_epoch=args.pred_start_epoch,
+        pred_shape=conf.pred_shape,
+        pred_start_epoch=conf.pred_start_epoch,
     )
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
         sampler=sampler,
-        batch_size=args.batch_size_per_gpu,
-        num_workers=args.num_workers,
+        batch_size=conf.batch_size_per_gpu,
+        num_workers=conf.num_workers,
         pin_memory=True,
         drop_last=True,
     )
     print(f"Data loaded: there are {len(dataset)} images.")
 
     # ============ building student and teacher networks ... ============
-    kw = dict(
-        img_size=[args.data_augmentation.global_crops_size]
-    )
+    kw = dict(img_size=[conf.transform.global_crops_size])
     # we changed the name DeiT-S for ViT-S to avoid confusions
-    args.arch = args.arch.replace("deit", "vit")
+    conf.arch = conf.arch.replace("deit", "vit")
     # if the network is of hierechical features (i.e. swin_tiny, swin_small, swin_base)
-    if args.arch in models.__dict__.keys() and "swin" in args.arch:
-        student = models.__dict__[args.arch](
-            window_size=args.window_size,
-            return_all_tokens=True,
-            masked_im_modeling=args.use_masked_im_modeling,
-            **kw
-        )
-        teacher = models.__dict__[args.arch](
-            window_size=args.window_size,
-            drop_path_rate=0.0,
-            return_all_tokens=True,
-            **kw
-        )
-        embed_dim = student.num_features
-    # if the network is a vision transformer (i.e. vit_tiny, vit_small, vit_base, vit_large)
-    elif args.arch in models.__dict__.keys():
-        student = models.__dict__[args.arch](
-            patch_size=args.patch_size,
-            drop_path_rate=args.drop_path,
-            return_all_tokens=True,
-            masked_im_modeling=args.use_masked_im_modeling,
-            **kw
-        )
-        teacher = models.__dict__[args.arch](
-            patch_size=args.patch_size,
-            return_all_tokens=True,
-            **kw
-        )
-        embed_dim = student.embed_dim
-    elif "resnet" in args.arch:
-        student: resnet.ResNet = resnet.__dict__[args.arch]()
-        teacher = resnet.__dict__[args.arch]()
-        embed_dim = student.fc.weight.shape[1]
-        student.fc = None
-        teacher.fc = None
-        student = utils.ResnetWrapper(student)
-        teacher = utils.ResnetWrapper(teacher)
-    elif args.arch == "medsam":
+    if conf.arch == "medsam":
         from models.medsam import MedSAMIBot
 
         student = MedSAMIBot()
         teacher = MedSAMIBot()
         embed_dim = 768
+    elif conf.arch in models.__dict__.keys() and "swin" in conf.arch:
+        student = models.__dict__[conf.arch](
+            window_size=conf.window_size,
+            return_all_tokens=True,
+            masked_im_modeling=conf.use_masked_im_modeling,
+            **kw,
+        )
+        teacher = models.__dict__[conf.arch](
+            window_size=conf.window_size,
+            drop_path_rate=0.0,
+            return_all_tokens=True,
+            **kw,
+        )
+        embed_dim = student.num_features
+    # if the network is a vision transformer (i.e. vit_tiny, vit_small, vit_base, vit_large)
+    elif conf.arch in models.__dict__.keys():
+        student = models.__dict__[conf.arch](
+            patch_size=conf.patch_size,
+            drop_path_rate=conf.drop_path,
+            return_all_tokens=True,
+            masked_im_modeling=conf.use_masked_im_modeling,
+            **kw,
+        )
+        teacher = models.__dict__[conf.arch](
+            patch_size=conf.patch_size, return_all_tokens=True, **kw
+        )
+        embed_dim = student.embed_dim
+    elif "resnet" in conf.arch:
+        student: resnet.ResNet = resnet.__dict__[conf.arch]()
+        teacher = resnet.__dict__[conf.arch]()
+        embed_dim = student.fc.weight.shape[1]
+        student.fc = None
+        teacher.fc = None
+        student = utils.ResnetWrapper(student)
+        teacher = utils.ResnetWrapper(teacher)
     else:
-        print(f"Unknow architecture: {args.arch}")
+        print(f"Unknow architecture: {conf.arch}")
 
     # multi-crop wrapper handles forward with inputs of different resolutions
     student = utils.MultiCropWrapper(
         student,
         iBOTHead(
             embed_dim,
-            args.out_dim,
-            patch_out_dim=args.patch_out_dim,
-            norm=args.norm_in_head,
-            act=args.act_in_head,
-            norm_last_layer=args.norm_last_layer,
-            shared_head=args.shared_head,
+            conf.out_dim,
+            patch_out_dim=conf.patch_out_dim,
+            norm=conf.norm_in_head,
+            act=conf.act_in_head,
+            norm_last_layer=conf.norm_last_layer,
+            shared_head=conf.shared_head,
         ),
     )
     teacher = utils.MultiCropWrapper(
         teacher,
         iBOTHead(
             embed_dim,
-            args.out_dim,
-            patch_out_dim=args.patch_out_dim,
-            norm=args.norm_in_head,
-            act=args.act_in_head,
-            shared_head=args.shared_head_teacher,
+            conf.out_dim,
+            patch_out_dim=conf.patch_out_dim,
+            norm=conf.norm_in_head,
+            act=conf.act_in_head,
+            shared_head=conf.shared_head_teacher,
         ),
     )
     # move networks to gpu
@@ -315,10 +161,10 @@ def train_ibot(args: Args):
         # we need DDP wrapper to have synchro batch norms working...
         teacher = (
             nn.parallel.DistributedDataParallel(
-                teacher, device_ids=[args.gpu], broadcast_buffers=False
+                teacher, device_ids=[conf.gpu], broadcast_buffers=False
             )
-            if "swin" in args.arch
-            else nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
+            if "swin" in conf.arch
+            else nn.parallel.DistributedDataParallel(teacher, device_ids=[conf.gpu])
         )
         teacher_without_ddp = teacher.module
     else:
@@ -326,86 +172,95 @@ def train_ibot(args: Args):
         teacher_without_ddp = teacher
     student = (
         nn.parallel.DistributedDataParallel(
-            student, device_ids=[args.gpu], broadcast_buffers=False
+            student, device_ids=[conf.gpu], broadcast_buffers=False
         )
-        if "swin" in args.arch
-        else nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
+        if "swin" in conf.arch
+        else nn.parallel.DistributedDataParallel(student, device_ids=[conf.gpu])
     )
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict(), strict=False)
     # there is no backpropagation through the teacher, so no need for gradients
     for p in teacher.parameters():
         p.requires_grad = False
-    print(f"Student and Teacher are built: they are both {args.arch} network.")
+    print(f"Student and Teacher are built: they are both {conf.arch} network.")
 
     # ============ preparing loss ... ============
-    same_dim = args.shared_head or args.shared_head_teacher
+    same_dim = conf.shared_head or conf.shared_head_teacher
 
     ibot_loss = iBOTLoss(
-        args.out_dim,
-        args.out_dim if same_dim else args.patch_out_dim,
-        args.data_augmentation.global_crops_number,
-        args.data_augmentation.local_crops_number,
-        args.warmup_teacher_temp,
-        args.teacher_temp,
-        args.warmup_teacher_patch_temp,
-        args.teacher_patch_temp,
-        args.warmup_teacher_temp_epochs,
-        args.epochs,
-        lambda1=args.lambda1,
-        lambda2=args.lambda2,
-        mim_start_epoch=args.pred_start_epoch,
+        conf.out_dim,
+        conf.out_dim if same_dim else conf.patch_out_dim,
+        conf.transform.global_crops_number,
+        conf.transform.local_crops_number,
+        conf.warmup_teacher_temp,
+        conf.teacher_temp,
+        conf.warmup_teacher_patch_temp,
+        conf.teacher_patch_temp,
+        conf.warmup_teacher_temp_epochs,
+        conf.epochs,
+        lambda1=conf.lambda1,
+        lambda2=conf.lambda2,
+        mim_start_epoch=conf.pred_start_epoch,
     ).cuda()
 
     if utils.is_main_process():  # wandb
         run = wandb.init(
-            project="iBOT", config=asdict(args), id=args.wandb_run_id, resume="allow"
+            project="iBOT",
+            config=OmegaConf.to_container(conf, resolve=True),
+            id=conf.wandb_run_id,
+            resume="allow",
         )
 
     # ============ preparing optimizer ... ============
-    params_groups = utils.get_params_groups(student)
-    if args.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(params_groups)  # to use with ViTs
-    elif args.optimizer == "sgd":
-        optimizer = torch.optim.SGD(
-            params_groups, lr=0, momentum=0.9
-        )  # lr is set by scheduler
-    elif args.optimizer == "lars":
-        optimizer = utils.LARS(params_groups)  # to use with convnet and large batches
-    # for mixed precision training
-    fp16_scaler = None
-    if args.use_fp16:
-        fp16_scaler = torch.cuda.amp.GradScaler()
+    # params_groups = utils.get_params_groups(student)
+    # if conf.optimizer == "adamw":
+    #     optimizer = torch.optim.AdamW(params_groups)  # to use with ViTs
+    # elif conf.optimizer == "sgd":
+    #     optimizer = torch.optim.SGD(
+    #         params_groups, lr=0, momentum=0.9
+    #     )  # lr is set by scheduler
+    # elif conf.optimizer == "lars":
+    #     optimizer = utils.LARS(params_groups)  # to use with convnet and large batches
+    # # for mixed precision training
+    # fp16_scaler = None
+    # if conf.use_fp16:
+    #     fp16_scaler = torch.cuda.amp.GradScaler()
+# 
+    # # ============ init schedulers ... ============
+    # lr_schedule = utils.cosine_scheduler(
+    #     conf.lr
+    #     * (conf.batch_size_per_gpu * utils.get_world_size())
+    #     / 256.0,  # linear scaling rule
+    #     conf.min_lr,
+    #     conf.epochs,
+    #     len(data_loader),
+    #     warmup_epochs=conf.warmup_epochs,
+    # )
+    # wd_schedule = utils.cosine_scheduler(
+    #     conf.weight_decay,
+    #     conf.weight_decay_end,
+    #     conf.epochs,
+    #     len(data_loader),
+    # )
+    # # momentum parameter is increased to 1. during training with a cosine schedule
+    # momentum_schedule = utils.cosine_scheduler(
+    #     conf.momentum_teacher, 1, conf.epochs, len(data_loader)
+    # )
 
-    # ============ init schedulers ... ============
-    lr_schedule = utils.cosine_scheduler(
-        args.lr
-        * (args.batch_size_per_gpu * utils.get_world_size())
-        / 256.0,  # linear scaling rule
-        args.min_lr,
-        args.epochs,
-        len(data_loader),
-        warmup_epochs=args.warmup_epochs,
-    )
-    wd_schedule = utils.cosine_scheduler(
-        args.weight_decay,
-        args.weight_decay_end,
-        args.epochs,
-        len(data_loader),
-    )
-    # momentum parameter is increased to 1. during training with a cosine schedule
-    momentum_schedule = utils.cosine_scheduler(
-        args.momentum_teacher, 1, args.epochs, len(data_loader)
+    optimizer, lr_schedulers, wd_schedulers, momentum_schedule, fp16_scaler = setup_optimization(
+        student, len(data_loader), conf
     )
 
     print(f"Loss, optimizer and schedulers ready.")
 
     # ============ setup additional evaluation ===============
-    if args.do_nct_probing:
+    if conf.do_nct_probing:
         print(f"Setting up NCT probing...")
         from probing_nct import NCTProbing
 
-        nct_probe = NCTProbing(args.batch_size_per_gpu, size=args.data_augmentation.global_crops_size)
+        nct_probe = NCTProbing(
+            conf.batch_size_per_gpu, size=conf.transform.global_crops_size
+        )
 
     # ============ optionally resume training ... ============
     to_restore = {"epoch": 0}
@@ -414,7 +269,7 @@ def train_ibot(args: Args):
     restore_variables["teacher"] = teacher
 
     # prefer to resume from latest checkpoint in output directory
-    if os.path.exists(p := os.path.join(args.output_dir, "checkpoint.pth")):
+    if os.path.exists(p := os.path.join(conf.output_dir, "checkpoint.pth")):
         print(f"Loading state from {p}")
         utils.restart_from_checkpoint(
             p,
@@ -425,7 +280,7 @@ def train_ibot(args: Args):
             fp16_scaler=fp16_scaler,
             ibot_loss=ibot_loss,
         )
-    elif (load_path := args.load_from) is not None:
+    elif (load_path := conf.load_from) is not None:
         # otherwise use 'load_from'
         assert os.path.exists(load_path), f"Load path {load_path} does not exist."
         print(f"Loading state from {load_path}")
@@ -438,7 +293,7 @@ def train_ibot(args: Args):
             fp16_scaler=fp16_scaler,
             ibot_loss=ibot_loss,
         )
-    elif (p := args.load_model_from) is not None:
+    elif (p := conf.load_model_from) is not None:
         assert os.path.exists(p), f"Load path {p} does not exist."
         print(f"Loading models from {p}")
         utils.restart_from_checkpoint(
@@ -449,7 +304,7 @@ def train_ibot(args: Args):
 
     start_time = time.time()
     print("Starting iBOT training!")
-    for epoch in range(start_epoch, args.epochs):
+    for epoch in range(start_epoch, conf.epochs):
         data_loader.sampler.set_epoch(epoch)
         data_loader.dataset.set_epoch(epoch)
 
@@ -461,12 +316,12 @@ def train_ibot(args: Args):
             ibot_loss,
             data_loader,
             optimizer,
-            lr_schedule,
-            wd_schedule,
+            lr_schedulers,
+            wd_schedulers,
             momentum_schedule,
             epoch,
             fp16_scaler,
-            args,
+            conf,
         )
 
         # ============ writing logs ... ============
@@ -475,15 +330,15 @@ def train_ibot(args: Args):
             "teacher": teacher.state_dict(),
             "optimizer": optimizer.state_dict(),
             "epoch": epoch + 1,
-            "args": args,
+            "args": conf,
             "ibot_loss": ibot_loss.state_dict(),
         }
         if fp16_scaler is not None:
             save_dict["fp16_scaler"] = fp16_scaler.state_dict()
-        utils.save_on_master(save_dict, os.path.join(args.output_dir, "checkpoint.pth"))
-        if args.saveckp_freq and (epoch % args.saveckp_freq == 0) and epoch:
+        utils.save_on_master(save_dict, os.path.join(conf.output_dir, "checkpoint.pth"))
+        if conf.saveckp_freq and (epoch % conf.saveckp_freq == 0) and epoch:
             utils.save_on_master(
-                save_dict, os.path.join(args.output_dir, f"checkpoint{epoch:04}.pth")
+                save_dict, os.path.join(conf.output_dir, f"checkpoint{epoch:04}.pth")
             )
         log_stats = {
             **{f"train_{k}": v for k, v in train_stats.items()},
@@ -491,7 +346,7 @@ def train_ibot(args: Args):
         }
 
         # ======== run and log probing results ========
-        if args.do_nct_probing and ((epoch + 1) % args.probing_freq == 0):
+        if conf.do_nct_probing and ((epoch + 1) % conf.probing_freq == 0):
             print(f"Running NCT Probing")
             probing_results = nct_probe.run_probing(
                 teacher_without_ddp,
@@ -506,9 +361,9 @@ def train_ibot(args: Args):
             log_stats.update(probing_results)
 
         if utils.is_main_process():
-            with (Path(args.output_dir) / "log.txt").open("a") as f:
+            with (Path(conf.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
-                run.log(log_stats)
+                # run.log(log_stats)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -522,15 +377,15 @@ def train_one_epoch(
     ibot_loss,
     data_loader,
     optimizer,
-    lr_schedule,
-    wd_schedule,
+    lr_schedulers,
+    wd_schedulers,
     momentum_schedule,
     epoch,
     fp16_scaler,
-    args: Args,
+    conf,
 ):
     metric_logger = utils.MetricLogger(delimiter="  ")
-    header = "Epoch: [{}/{}]".format(epoch, args.epochs)
+    header = "Epoch: [{}/{}]".format(epoch, conf.epochs)
 
     # common params
     names_q, params_q, names_k, params_k = [], [], [], []
@@ -554,10 +409,14 @@ def train_one_epoch(
     ):
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
-        for i, param_group in enumerate(optimizer.param_groups):
+        lrs_and_wds_for_logging = {}
+        for i, (param_group, lr_schedule, wd_schedule) in enumerate(zip(optimizer.param_groups, lr_schedulers, wd_schedulers)):
             param_group["lr"] = lr_schedule[it]
-            if i == 0:  # only the first group is regularized
-                param_group["weight_decay"] = wd_schedule[it]
+            param_group["weight_decay"] = wd_schedule[it]
+            lrs_and_wds_for_logging.update({
+                f'lr_{i}': lr_schedule[it], 
+                f'wd_{i}': wd_schedule[it],
+            })
 
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images]
@@ -565,20 +424,20 @@ def train_one_epoch(
 
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             # get global views
-            teacher_output = teacher(images[: args.data_augmentation.global_crops_number])
+            teacher_output = teacher(images[: conf.transform.global_crops_number])
             student_output = student(
-                images[: args.data_augmentation.global_crops_number],
-                mask=masks[: args.data_augmentation.global_crops_number],
+                images[: conf.transform.global_crops_number],
+                mask=masks[: conf.transform.global_crops_number],
             )
 
             # get local views
             student.module.backbone.masked_im_modeling = False
             student_local_cls = (
-                student(images[args.data_augmentation.global_crops_number :])[0]
-                if len(images) > args.data_augmentation.global_crops_number
+                student(images[conf.transform.global_crops_number :])[0]
+                if len(images) > conf.transform.global_crops_number
                 else None
             )
-            student.module.backbone.masked_im_modeling = args.use_masked_im_modeling
+            student.module.backbone.masked_im_modeling = conf.use_masked_im_modeling
 
             all_loss = ibot_loss(
                 student_output, teacher_output, student_local_cls, masks, epoch
@@ -586,7 +445,7 @@ def train_one_epoch(
             loss = all_loss.pop("loss")
 
             if wandb.run is not None:
-                wandb.log({"loss": loss.item()})
+                wandb.log({"loss": loss.item(), **lrs_and_wds_for_logging})
 
         losses_across_batch = utils.concat_all_gather(loss.view(1))
         if any([not math.isfinite(loss_.item()) for loss_ in losses_across_batch]):
@@ -594,8 +453,8 @@ def train_one_epoch(
             continue
 
         # log statistics
-        probs1 = teacher_output[0].chunk(args.data_augmentation.global_crops_number)
-        probs2 = student_output[0].chunk(args.data_augmentation.global_crops_number)
+        probs1 = teacher_output[0].chunk(conf.transform.global_crops_number)
+        probs2 = student_output[0].chunk(conf.transform.global_crops_number)
         pred1 = utils.concat_all_gather(probs1[0].max(dim=1)[1])
         pred2 = utils.concat_all_gather(probs2[1].max(dim=1)[1])
         acc = (pred1 == pred2).sum() / pred1.size(0)
@@ -607,18 +466,18 @@ def train_one_epoch(
         param_norms = None
         if fp16_scaler is None:
             loss.backward()
-            if args.clip_grad:
-                param_norms = utils.clip_gradients(student, args.clip_grad)
-            utils.cancel_gradients_last_layer(epoch, student, args.freeze_last_layer)
+            if conf.clip_grad:
+                param_norms = utils.clip_gradients(student, conf.clip_grad)
+            utils.cancel_gradients_last_layer(epoch, student, conf.freeze_last_layer)
             optimizer.step()
         else:
             fp16_scaler.scale(loss).backward()
-            if args.clip_grad:
+            if conf.clip_grad:
                 fp16_scaler.unscale_(
                     optimizer
                 )  # unscale the gradients of optimizer's assigned params in-place
-                param_norms = utils.clip_gradients(student, args.clip_grad)
-            utils.cancel_gradients_last_layer(epoch, student, args.freeze_last_layer)
+                param_norms = utils.clip_gradients(student, conf.clip_grad)
+            utils.cancel_gradients_last_layer(epoch, student, conf.freeze_last_layer)
             fp16_scaler.step(optimizer)
             fp16_scaler.update()
 
@@ -642,7 +501,7 @@ def train_one_epoch(
 
     return_dict = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
-    if args.do_unsupervised_eval:
+    if conf.do_unsupervised_eval:
         nmi, ari, fscore, adjacc = eval_pred(real_labels, pred_labels, calc_acc=False)
         # gather the stats from all processes
         metric_logger.synchronize_between_processes()
@@ -651,6 +510,103 @@ def train_one_epoch(
         return_dict.update({"nmi": nmi, "ari": ari, "fscore": fscore, "adjacc": adjacc})
 
     return return_dict
+
+
+def build_models(conf): ...
+
+
+def setup_optimization(student, num_iters_per_epoch, conf):
+    batch_size_per_gpu = conf.batch_size_per_gpu
+    epochs = conf.epochs
+
+    def compute_true_lr_from_base_lr(base_lr):
+        return base_lr * batch_size_per_gpu * utils.get_world_size() / 256.0
+
+    params_groups = []
+    lr_schedulers = []
+    wd_schedulers = []
+
+    for group_name, named_parameters in get_named_parameter_groups(student).items():
+
+        opt_conf_for_group = conf.optimizer.get(group_name)
+        if opt_conf_for_group is None:
+            raise ValueError(
+                f"Trying to configure optimizer for group {group_name}, but did not find it in config (keys {list(conf.optimizer.keys())})"
+            )
+
+        # get regularized vs. non-regularized parameter groups
+        regularized = []
+        not_regularized = []
+        for name, param in named_parameters:
+            if not param.requires_grad:
+                continue
+            # we do not regularize biases nor Norm parameters
+            if name.endswith(".bias") or len(param.shape) == 1:
+                not_regularized.append(param)
+            else:
+                regularized.append(param)
+
+        regularized = {"params": regularized}
+        params_groups.append(regularized)
+        not_regularized = {"params": not_regularized, "weight_decay": 0.0}
+        params_groups.append(not_regularized)
+        for _ in range(
+            2
+        ):  # lr has the same schedule for regularized vs. non_regularized
+            lr_schedulers.append(
+                utils.cosine_scheduler(
+                    compute_true_lr_from_base_lr(
+                        opt_conf_for_group.base_lr
+                    ),  # linear scaling rule
+                    opt_conf_for_group.min_lr,
+                    epochs,
+                    num_iters_per_epoch,
+                    warmup_epochs=opt_conf_for_group.warmup_epochs,
+                    frozen_epochs=opt_conf_for_group.frozen_epochs,
+                    num_annealing_phases=opt_conf_for_group.get(
+                        "num_annealing_phases", 1
+                    ),
+                )
+            )
+        wd_schedulers.append(
+            utils.cosine_scheduler(
+                opt_conf_for_group.weight_decay,
+                opt_conf_for_group.weight_decay_end,
+                epochs,
+                num_iters_per_epoch,
+            )
+        )
+        # second group receives 0 wd
+        wd_schedulers.append(utils.cosine_scheduler(0, 0, epochs, num_iters_per_epoch))
+
+    # ============ preparing optimizer ... ============
+    if conf.optimizer.type == "adamw":
+        optimizer = torch.optim.AdamW(params_groups)  # to use with ViTs
+    elif conf.optimizer.type == "sgd":
+        optimizer = torch.optim.SGD(
+            params_groups, lr=0, momentum=0.9
+        )  # lr is set by scheduler
+    elif conf.optimizer.type == "lars":
+        optimizer = utils.LARS(params_groups)  # to use with convnet and large batches
+
+    # for mixed precision training
+    fp16_scaler = None
+    if conf.use_fp16:
+        fp16_scaler = torch.cuda.amp.GradScaler()
+
+    # momentum parameter is increased to 1. during training with a cosine schedule
+    momentum_schedule = utils.cosine_scheduler(
+        conf.momentum_teacher, 1, conf.epochs, num_iters_per_epoch
+    )
+
+    return optimizer, lr_schedulers, wd_schedulers, momentum_schedule, fp16_scaler
+
+
+def get_named_parameter_groups(model: nn.Module):
+    if isinstance(model, MedSAMIBot):
+        raise NotImplementedError()
+    else:
+        return {"main": model.named_parameters()}
 
 
 class iBOTLoss(nn.Module):
@@ -911,14 +867,22 @@ class DataAugmentationiBOT(object):
 
 
 if __name__ == "__main__":
-    from simple_parsing import parse 
-    args: Args = parse(Args)
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--config", "-c", default=os.path.join("conf", "main_ibot_defaults.yaml")
+    )
+    parser.add_argument("--help", "-h", action="store_true")
+    args, extras = parser.parse_known_args()
 
+    conf = OmegaConf.load(args.config)
+    conf = OmegaConf.merge(conf, OmegaConf.from_cli(extras))
 
-    # parser = argparse.ArgumentParser(
-    #     "iBOT",
-    #     parents=[get_args_parser()],
-    #     formatter_class=rich_argparse.ArgumentDefaultsRichHelpFormatter,
-    # )
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    train_ibot(args)
+    if args.help:
+        print("========")
+        parser.print_help()
+        print("========")
+        rich.print(OmegaConf.to_yaml(conf))
+        print("========")
+        sys.exit(0)
+
+    train_ibot(conf)
