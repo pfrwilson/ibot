@@ -29,7 +29,7 @@ from collections import defaultdict, deque
 from pathlib import Path
 from torch import nn
 from PIL import ImageFilter, ImageOps, Image, ImageDraw
-from typing import Iterable
+from typing import Callable, Iterable
 
 
 class GaussianBlur(object):
@@ -256,19 +256,51 @@ def restart_from_checkpoint(ckp_path, run_variables=None, **kwargs):
 
 
 def cosine_scheduler(
-    base_value, final_value, epochs, niter_per_ep, warmup_epochs=0, start_warmup_value=0
+    base_value,
+    final_value,
+    epochs,
+    niter_per_ep,
+    warmup_epochs=0,
+    start_warmup_value=0,
+    frozen_epochs=0,
+    num_annealing_phases=1,
+    lr_factor_by_phase=[1.]
 ):
+    total_iters = epochs * niter_per_ep
+
+    schedule_phases = []
+
+    frozen_schedule = np.array([])
+    frozen_iters = frozen_epochs * niter_per_ep
+    if frozen_epochs > 0:
+        frozen_schedule = np.zeros(frozen_iters)
+    schedule_phases.append(frozen_schedule)
+
     warmup_schedule = np.array([])
     warmup_iters = warmup_epochs * niter_per_ep
     if warmup_epochs > 0:
         warmup_schedule = np.linspace(start_warmup_value, base_value, warmup_iters)
+    schedule_phases.append(warmup_schedule)
 
-    iters = np.arange(epochs * niter_per_ep - warmup_iters)
-    schedule = final_value + 0.5 * (base_value - final_value) * (
-        1 + np.cos(np.pi * iters / len(iters))
-    )
+    total_iters_for_annealing = epochs * niter_per_ep - warmup_iters - frozen_iters
 
-    schedule = np.concatenate((warmup_schedule, schedule))
+    for phase_idx in range(num_annealing_phases):
+        factor_for_phase = lr_factor_by_phase[phase_idx]
+        iters_for_phase = total_iters_for_annealing // num_annealing_phases
+        iters = np.arange(iters_for_phase)
+        schedule = final_value + 0.5 * (base_value * factor_for_phase - final_value) * (
+            1 + np.cos(np.pi * iters / len(iters))
+        )
+        schedule_phases.append(schedule)
+
+    tail = np.array([])
+    total_scheduled_iters = sum([len(phase) for phase in schedule_phases])
+    remaining_iters = total_iters - total_scheduled_iters
+    if remaining_iters > 0: 
+        tail = np.zeros(remaining_iters)
+    schedule_phases.append(tail)
+
+    schedule = np.concatenate(schedule_phases)
     assert len(schedule) == epochs * niter_per_ep
     return schedule
 
@@ -543,10 +575,7 @@ def is_main_process():
 
 def save_on_master(obj, f, *args, **kwargs):
     if is_main_process():
-        f_tmp = os.path.join(
-            os.path.dirname(f), 
-            'tmp.pth'
-        )
+        f_tmp = os.path.join(os.path.dirname(f), "tmp.pth")
         torch.save(obj, f_tmp, *args, **kwargs)
         os.rename(f_tmp, f)
 
@@ -991,36 +1020,41 @@ def compute_map(ranks, gnd, kappas=[]):
 
 
 class ResnetWrapper(nn.Module):
-    def __init__(self, model: timm.models.ResNet): 
+    def __init__(self, model: timm.models.ResNet):
         super().__init__()
         self.model = model
 
     def forward(self, x, mask=None):
         feature_map = self.model.forward_features(x)
-        b, c, h, w = feature_map.shape 
+        b, c, h, w = feature_map.shape
         avgpool = self.model.global_pool(feature_map)
 
         feature_map_as_tokens = feature_map.reshape(b, c, h * w).permute(0, 2, 1)
-        b, c = avgpool.shape 
+        b, c = avgpool.shape
         avgpool = avgpool[:, None, :]
 
-        return torch.cat(
-            [avgpool, feature_map_as_tokens], dim=1
-        )
+        return torch.cat([avgpool, feature_map_as_tokens], dim=1)
 
 
 class MyClass:
-    def __init__(self, a: int, foo: int = 1, bar: str = 2, c: list[Path]=[], d: tuple[int]=(1)): 
-        """Build A 
+    def __init__(
+        self,
+        a: int,
+        foo: int = 1,
+        bar: str = 2,
+        c: list[Path] = [],
+        d: tuple[int] = (1),
+    ):
+        """Build A
 
         Builds an instance of the class A
 
-        Args: 
+        Args:
             a: do something
             foo: number
             c: list of paths
         """
-        self.a = a 
+        self.a = a
         self.foo = foo
         self.bar = bar
         self.c = c
@@ -1029,45 +1063,43 @@ class MyClass:
         return str(vars(self))
 
 
-class ArgparseHelper: 
+class ArgparseHelper:
     @staticmethod
     def add_args(parser: ArgumentParser, callable, ignore_keys=[], group=None):
-        parsed_doc = docstring_parser.parse(callable.__doc__ or "")    
-        doc_params = {
-            arg.arg_name: arg.description for arg in parsed_doc.params
-        }
+        parsed_doc = docstring_parser.parse(callable.__doc__ or "")
+        doc_params = {arg.arg_name: arg.description for arg in parsed_doc.params}
 
-        if group is not None: 
+        if group is not None:
             parser = parser.add_argument_group(group, parsed_doc.short_description)
 
-        parameters = inspect.signature(callable).parameters  
-        
-        for key, param in parameters.items(): 
+        parameters = inspect.signature(callable).parameters
+
+        for key, param in parameters.items():
 
             parse_kw = {}
 
-            if key in ignore_keys: 
+            if key in ignore_keys:
                 continue
-            if param.default is inspect._empty: 
-                parse_kw['default'] = None
-                parse_kw['required'] = True 
-            else: 
-                parse_kw['default'] = param.default
-                parse_kw['required'] = False
+            if param.default is inspect._empty:
+                parse_kw["default"] = None
+                parse_kw["required"] = True
+            else:
+                parse_kw["default"] = param.default
+                parse_kw["required"] = False
 
-            if param.annotation is inspect._empty: 
+            if param.annotation is inspect._empty:
                 raise ValueError(f"Can't add args without annotations")
 
-            if hasattr(param.annotation, '__origin__'): 
-                if issubclass(param.annotation.__origin__, Iterable): 
-                    parse_kw['nargs'] = '+'
-                    parse_kw['type'] = param.annotation.__args__[0]
-                else: 
+            if hasattr(param.annotation, "__origin__"):
+                if issubclass(param.annotation.__origin__, Iterable):
+                    parse_kw["nargs"] = "+"
+                    parse_kw["type"] = param.annotation.__args__[0]
+                else:
                     raise ValueError(f"Can't parse type annotation {param.annotation}")
             else:
-                parse_kw['type'] = param.annotation
+                parse_kw["type"] = param.annotation
 
-            parse_kw['help'] = doc_params.get(key, key)
+            parse_kw["help"] = doc_params.get(key, key)
 
             parser.add_argument(f"--{key}", **parse_kw)
 
@@ -1075,17 +1107,116 @@ class ArgparseHelper:
     def add_class_args(parser, cls, ignore_keys=[], group=None):
         group = group or cls.__name__
         ignore_keys = ignore_keys.copy()
-        ignore_keys.append('self')
+        ignore_keys.append("self")
         ArgparseHelper.add_args(parser, cls.__init__, ignore_keys, group)
 
-
     @staticmethod
-    def get_kwargs(args, callable): 
-        parameters = inspect.signature(callable).parameters  
+    def get_kwargs(args, callable):
+        parameters = inspect.signature(callable).parameters
         kw = {}
-        for key in parameters.keys(): 
-            if key in args.__dict__: 
+        for key in parameters.keys():
+            if key in args.__dict__:
                 kw[key] = getattr(args, key)
         return kw
 
 
+def cosine_schedule(cur_iter, total_iter):
+    factor = 0.5 * (1 + np.cos(np.pi * cur_iter / total_iter))
+    return factor
+
+
+class CosineScheduleWithWarmRestarts:
+    def __init__(self, num_restarts, restart_factors: list[float] | None = None):
+        if restart_factors is None:
+            restart_factors = 1 * num_restarts
+        self.restart_factors = restart_factors
+        self.num_restarts = num_restarts
+
+    def __call__(self, cur_iter, total_iter):
+        iters_between_restarts = total_iter // self.num_restarts
+        cur_iter_in_restart_phase = cur_iter % iters_between_restarts
+        cur_restart_phase_idx = cur_iter // iters_between_restarts
+        if cur_restart_phase_idx >= len(self.restart_factors):
+            # this could happen if total_iter is not cleanly divisible by num_restarts -
+            # some of the training iterations would "spill over" into a new restart
+            # phase that doesn't exist.
+            return 0
+        factor = self.restart_factors[cur_restart_phase_idx]
+
+        return (
+            cosine_schedule(cur_iter_in_restart_phase, iters_between_restarts) * factor
+        )
+
+
+class _LRCalculatorWithWarmupAndFrozenEpochs:
+    def __init__(
+        self,
+        frozen_epochs,
+        warmup_epochs,
+        total_epochs,
+        niter_per_ep,
+        after_warmup_lr_calculator: Callable,
+    ):
+        self.frozen_epochs = frozen_epochs
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.niter_per_ep = niter_per_ep
+        self.after_warmup_lr_calculator = after_warmup_lr_calculator
+
+    def compute_factor(self, iter):
+        if iter < self.frozen_epochs * self.niter_per_ep:
+            return 0
+        elif iter < (self.frozen_epochs + self.warmup_epochs) * self.niter_per_ep:
+            return (iter - self.frozen_epochs * self.niter_per_ep) / (
+                self.warmup_epochs * self.niter_per_ep
+            )
+        else:
+            cur_iter = (
+                iter - (self.frozen_epochs + self.warmup_epochs) * self.niter_per_ep
+            )
+            total_iter = (
+                self.total_epochs - self.warmup_epochs - self.frozen_epochs
+            ) * self.niter_per_ep
+            return self.after_warmup_lr_calculator(cur_iter, total_iter)
+
+    def __call__(self, iter):
+        factor = self.compute_factor(iter)
+        return factor
+
+
+class CosineAnnealingLRCalculatorWithWarmupAndFrozenEpochs(
+    _LRCalculatorWithWarmupAndFrozenEpochs
+):
+    def __init__(self, frozen_epochs, warmup_epochs, total_epochs, niter_per_ep):
+        super().__init__(
+            frozen_epochs, warmup_epochs, total_epochs, niter_per_ep, cosine_schedule
+        )
+
+
+class CosineAnnealingLRCalculaterWarmRestartsWithWarmupAndFrozenEpochs(
+    _LRCalculatorWithWarmupAndFrozenEpochs
+):
+    def __init__(
+        self,
+        frozen_epochs,
+        warmup_epochs,
+        total_epochs,
+        niter_per_ep,
+        num_restarts,
+        restart_factors=None,
+    ):
+        super().__init__(
+            frozen_epochs,
+            warmup_epochs,
+            total_epochs,
+            niter_per_ep,
+            CosineScheduleWithWarmRestarts(num_restarts, restart_factors),
+        )
+
+
+if __name__ == "__main__":
+    sched = cosine_scheduler(0, 0, 100, 100, 0, 0, 5, 3, [1, 0.8, 0.6])
+    import matplotlib.pyplot as plt
+
+    plt.plot(sched)
+    plt.savefig("test.png")
