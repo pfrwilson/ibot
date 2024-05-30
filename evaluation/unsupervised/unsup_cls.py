@@ -10,13 +10,13 @@ import argparse
 import copy
 import torch
 import torch.backends.cudnn as cudnn
-import utils
-import models
+import src.utils as utils
+import src.models as models
 
 from sklearn import metrics
 from munkres import Munkres
 from torchvision import transforms as pth_transforms
-from models.head import DINOHead
+from src.models.head import DINOHead
 from loader import ImageFolder
 
 

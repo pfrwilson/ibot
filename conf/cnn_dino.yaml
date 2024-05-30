@@ -1,8 +1,6 @@
-
 # model
-arch: vit_small
-patch_size: 16
-window_size: 7
+arch: resnet50
+patch_size: 32
 out_dim: 8192
 patch_out_dim: 8192
 shared_head: false
@@ -11,7 +9,7 @@ norm_last_layer: true
 momentum_teacher: 0.996
 norm_in_head: null
 act_in_head: gelu
-use_masked_im_modeling: true
+use_masked_im_modeling: false
 pred_ratio: 0.3
 pred_ratio_var: 0
 pred_shape: block
@@ -46,18 +44,21 @@ load_from: null
 load_model_from: null
 drop_path: 0.1
 data_path: /ssd005/projects/exactvu_pca/unlabelled_microus_png
-output_dir: .
+output_dir: null
 saveckp_freq: 40
 seed: 0
 num_workers: 10
 dist_url: env://
 local_rank: 0
+rank: 0
+world_size: 1
+gpu: 0
 
 # other options
 do_unsupervised_eval: false
 do_nct_probing: false
-probing_freq: 1
-wandb_run_id: null
+do_clstoken_nct_probing: true
+probing_freq: 5
 
 transform:
   global_crops_scale:
@@ -84,3 +85,6 @@ transform:
   solarization_prob: 0.2
   initial_crop_size: null
   initial_resize_size: null
+
+wandb_run_id: null
+wandb: {}

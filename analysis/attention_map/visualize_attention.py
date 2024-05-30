@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torchvision
 import numpy as np
-import utils
+import src.utils as utils
 import models
 
 from PIL import Image

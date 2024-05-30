@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 
 from functools import partial
-from utils import trunc_normal_
+from src.utils import trunc_normal_
 from timm.models.registry import register_model
 from einops.layers.torch import Rearrange
 from einops import pack, unpack

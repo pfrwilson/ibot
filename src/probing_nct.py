@@ -1,3 +1,4 @@
+from typing import Any
 import torch
 import numpy as np
 from torch import nn
@@ -46,7 +47,7 @@ class NCTProbing:
 
 
 @torch.no_grad()
-def run_probing(model, loader, epoch: int, device: str, is_main_process=True):
+def run_probing(model, loader, epoch: int, device: str, is_main_process=True) -> tuple[dict[str, Any], dict[str, Any]]:
     model.eval()
 
     train_outputs = extract_all_data(model, loader, device)
@@ -69,7 +70,6 @@ def run_probing(model, loader, epoch: int, device: str, is_main_process=True):
             patient_ids
         ):
 
-            
             train_patient_ids = patient_ids[train_index]
             val_patient_ids = patient_ids[val_index]
 
@@ -105,12 +105,10 @@ def run_probing(model, loader, epoch: int, device: str, is_main_process=True):
         average_auc /= 5
         average_train_auc /= 5
 
-        metrics.update({
-            "train_auc_probing": average_train_auc,
-            "val_auc_probing": average_auc,
-        })
+        train_metrics = {"auc": average_train_auc}
+        val_metrics = {"auc": average_auc}
 
-        return metrics
+        return train_metrics, val_metrics
 
 
 @torch.no_grad()

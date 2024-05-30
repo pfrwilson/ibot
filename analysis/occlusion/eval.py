@@ -17,7 +17,7 @@ import torch
 import torchvision
 import torchvision.datasets as datasets
 import torchvision.utils as vutils
-import utils
+import src.utils as utils
 import dino
 
 from einops import rearrange

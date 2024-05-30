@@ -12,7 +12,7 @@ import torch.nn as nn
 import numpy as np
 import random
 import matplotlib.pyplot as plt
-import utils
+import src.utils as utils
 import torchvision.transforms.functional as TF
 import models
 

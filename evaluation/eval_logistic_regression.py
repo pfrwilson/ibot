@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 import cyanure as ars
-import utils
+import src.utils as utils
 import models
 
 from torch import nn

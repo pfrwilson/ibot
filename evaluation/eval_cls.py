@@ -24,7 +24,7 @@ import sys
 import copy
 import scipy.io as scio
 import models
-import utils
+import src.utils as utils
 
 from pathlib import Path
 from typing import Iterable, Optional

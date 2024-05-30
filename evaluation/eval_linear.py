@@ -9,14 +9,18 @@ Copy-paste from DINO library:
 https://github.com/facebookresearch/dino
 """
 
+import sys
+import os
+sys.path.append(os.path.abspath('.'))
+
 import os
 import argparse
 import json
 import copy
 import torch
 import torch.backends.cudnn as cudnn
-import utils
-import models
+import src.utils as utils
+import src.models as models
 
 from pathlib import Path
 from torch import nn

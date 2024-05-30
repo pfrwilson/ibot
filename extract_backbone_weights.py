@@ -6,7 +6,7 @@
 
 import torch
 import argparse
-import utils
+import src.utils as utils
 
 def parse_args():
     parser = argparse.ArgumentParser(

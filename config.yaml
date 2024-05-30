@@ -1,5 +1,4 @@
-# model
-arch: medsam
+arch: vit_small
 patch_size: 16
 window_size: 7
 out_dim: 8192
@@ -7,7 +6,7 @@ patch_out_dim: 8192
 shared_head: false
 shared_head_teacher: true
 norm_last_layer: true
-momentum_teacher: 0.9995 # reduced to account for smaller batch size
+momentum_teacher: 0.9995
 norm_in_head: null
 act_in_head: gelu
 use_masked_im_modeling: true
@@ -15,10 +14,8 @@ pred_ratio: 0.3
 pred_ratio_var: 0
 pred_shape: block
 pred_start_epoch: 0
-lambda1: 1.0 # loss weights
-lambda2: 1.0 
-
-# training
+lambda1: 1.0
+lambda2: 1.0
 warmup_teacher_temp: 0.04
 teacher_temp: 0.04
 warmup_teacher_patch_temp: 0.04
@@ -26,45 +23,36 @@ teacher_patch_temp: 0.07
 warmup_teacher_temp_epochs: 30
 use_fp16: true
 clip_grad: 3.0
-batch_size_per_gpu: 1
+batch_size_per_gpu: 512
 epochs: 100
 freeze_last_layer: 1
-
-optimizer: 
-  type: adamw 
-  main: # configuration of main parameter group 
-    base_lr: 1e-4
+optimizer:
+  type: adamw
+  main:
+    base_lr: 0.0001
     frozen_epochs: 0
     warmup_epochs: 10
     weight_decay: 0.04
     weight_decay_end: 0.4
     min_lr: 1.0e-06
-
-# paths
 load_from: null
 load_model_from: null
 drop_path: 0.1
 data_path: /ssd005/projects/exactvu_pca/unlabelled_microus_png
 output_dir: .
-
 saveckp_freq: 40
 seed: 0
 num_workers: 10
-
-# distributed
 dist_url: env://
 local_rank: 0
 rank: 0
 world_size: 1
 gpu: 0
-
-# other options
 do_unsupervised_eval: false
-do_nct_probing: true
+do_nct_probing: false
 do_clstoken_nct_probing: true
-probing_freq: 5
+probing_freq: 1
 wandb_run_id: null
-
 transform:
   global_crops_scale:
   - 0.14
@@ -74,7 +62,7 @@ transform:
   - 0.4
   global_crops_number: 2
   local_crops_number: 0
-  global_crops_size: 224
+  global_crops_size: 128
   local_crops_size: 96
   jitter_prob: 0
   mean:
@@ -90,5 +78,6 @@ transform:
   solarization_prob: 0
   initial_crop_size: null
   initial_resize_size: null
-
-wandb: {}
+wandb:
+  name: debug
+  mode: disabled

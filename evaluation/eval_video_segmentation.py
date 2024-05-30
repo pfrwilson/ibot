@@ -15,7 +15,7 @@ import glob
 import queue
 import argparse
 import numpy as np
-import utils
+import src.utils as utils
 import models
 import cv2
 import torch

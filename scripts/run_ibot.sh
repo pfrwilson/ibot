@@ -27,4 +27,8 @@ python main_ibot.py \
     --clip_grad 1 \
     --lr 1e-4 \
     --epochs 200 \
-    --load_model_from "/checkpoint/pwilson/12540874/checkpoint.pth" 
+    --solarization_prob 0 \
+    --blur_prob_1 0 \
+    --blur_prob_2 0 \
+    --jitter_prob 0 \
+    #--load_model_from "/checkpoint/pwilson/12540874/checkpoint.pth" 

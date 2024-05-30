@@ -12,47 +12,68 @@ import datetime
 import time
 import math
 import json
+import hydra.conf
+import hydra.core
 import numpy as np
-from torch.optim import lr_scheduler
-from models.medsam import MedSAMIBot
-import utils
-import models
+import hydra.conf.hydra
+import hydra.conf.hydra.env
+import src
+import src.models
+from src.models.medsam import MedSAMIBot
+import src.models.wrappers
+import src.utils as utils
+import src.models as models
+from src.models.medsam import MedSAMIBot
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
+import hydra
 
 from pathlib import Path
 from PIL import Image
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
 import wandb
-from models.head import iBOTHead
+from src.models.head import iBOTHead
 from loader import ImageFolderMask
 from evaluation.unsupervised.unsup_cls import eval_pred
 from timm.models import resnet
 import rich
 from omegaconf import OmegaConf
-
+import logging
+from src.probing_nct import NCTProbing
 import dotenv
+from src.transform import DataAugmentation
+import hydra
+from src.ssl_evaluation import build_linear_probe_for_nct_patches
+
 
 dotenv.load_dotenv()
 
 
 def train_ibot(conf):
-    OmegaConf.save(conf, os.path.join(conf.output_dir, "config.yaml"), resolve=True)
+    # OmegaConf.save(conf, os.path.join(conf.output_dir, "config.yaml"), resolve=True)
 
     utils.init_distributed_mode(conf)
     utils.fix_random_seeds(conf.seed)
 
-    print("===============")
-    print(OmegaConf.to_yaml(conf))
-    print("===============")
-    cudnn.benchmark = True
+    if utils.is_main_process():
+        logging.basicConfig(
+            handlers=[
+                logging.StreamHandler(sys.stdout),
+                logging.FileHandler(os.path.join(conf.output_dir, "experiment.log")),
+            ],
+            level=logging.INFO,
+            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        )
+    else:
+        logging.getLogger("root").setLevel(logging.ERROR)
+
+    # torch.backends.cudnn.benchmark = True
 
     # ============ preparing data ... ============
-    transform = DataAugmentationiBOT(
+    transform = DataAugmentation(
         **conf.transform,
     )
 
@@ -76,81 +97,10 @@ def train_ibot(conf):
         pin_memory=True,
         drop_last=True,
     )
-    print(f"Data loaded: there are {len(dataset)} images.")
+    logging.info(f"Data loaded: there are {len(dataset)} images.")
 
-    # ============ building student and teacher networks ... ============
-    kw = dict(img_size=[conf.transform.global_crops_size])
-    # we changed the name DeiT-S for ViT-S to avoid confusions
-    conf.arch = conf.arch.replace("deit", "vit")
-    # if the network is of hierechical features (i.e. swin_tiny, swin_small, swin_base)
-    if conf.arch == "medsam":
-        from models.medsam import MedSAMIBot
+    student, teacher = build_models(conf)
 
-        student = MedSAMIBot()
-        teacher = MedSAMIBot()
-        embed_dim = 768
-    elif conf.arch in models.__dict__.keys() and "swin" in conf.arch:
-        student = models.__dict__[conf.arch](
-            window_size=conf.window_size,
-            return_all_tokens=True,
-            masked_im_modeling=conf.use_masked_im_modeling,
-            **kw,
-        )
-        teacher = models.__dict__[conf.arch](
-            window_size=conf.window_size,
-            drop_path_rate=0.0,
-            return_all_tokens=True,
-            **kw,
-        )
-        embed_dim = student.num_features
-    # if the network is a vision transformer (i.e. vit_tiny, vit_small, vit_base, vit_large)
-    elif conf.arch in models.__dict__.keys():
-        student = models.__dict__[conf.arch](
-            patch_size=conf.patch_size,
-            drop_path_rate=conf.drop_path,
-            return_all_tokens=True,
-            masked_im_modeling=conf.use_masked_im_modeling,
-            **kw,
-        )
-        teacher = models.__dict__[conf.arch](
-            patch_size=conf.patch_size, return_all_tokens=True, **kw
-        )
-        embed_dim = student.embed_dim
-    elif "resnet" in conf.arch:
-        student: resnet.ResNet = resnet.__dict__[conf.arch]()
-        teacher = resnet.__dict__[conf.arch]()
-        embed_dim = student.fc.weight.shape[1]
-        student.fc = None
-        teacher.fc = None
-        student = utils.ResnetWrapper(student)
-        teacher = utils.ResnetWrapper(teacher)
-    else:
-        print(f"Unknow architecture: {conf.arch}")
-
-    # multi-crop wrapper handles forward with inputs of different resolutions
-    student = utils.MultiCropWrapper(
-        student,
-        iBOTHead(
-            embed_dim,
-            conf.out_dim,
-            patch_out_dim=conf.patch_out_dim,
-            norm=conf.norm_in_head,
-            act=conf.act_in_head,
-            norm_last_layer=conf.norm_last_layer,
-            shared_head=conf.shared_head,
-        ),
-    )
-    teacher = utils.MultiCropWrapper(
-        teacher,
-        iBOTHead(
-            embed_dim,
-            conf.out_dim,
-            patch_out_dim=conf.patch_out_dim,
-            norm=conf.norm_in_head,
-            act=conf.act_in_head,
-            shared_head=conf.shared_head_teacher,
-        ),
-    )
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
     # synchronize batch norms (if any)
@@ -182,7 +132,7 @@ def train_ibot(conf):
     # there is no backpropagation through the teacher, so no need for gradients
     for p in teacher.parameters():
         p.requires_grad = False
-    print(f"Student and Teacher are built: they are both {conf.arch} network.")
+    logging.info(f"Student and Teacher are built: they are both {conf.arch} network.")
 
     # ============ preparing loss ... ============
     same_dim = conf.shared_head or conf.shared_head_teacher
@@ -204,63 +154,21 @@ def train_ibot(conf):
     ).cuda()
 
     if utils.is_main_process():  # wandb
-        run = wandb.init(
+        wandb.init(
             project="iBOT",
             config=OmegaConf.to_container(conf, resolve=True),
-            id=conf.wandb_run_id,
             resume="allow",
+            **conf.wandb
         )
 
-    # ============ preparing optimizer ... ============
-    # params_groups = utils.get_params_groups(student)
-    # if conf.optimizer == "adamw":
-    #     optimizer = torch.optim.AdamW(params_groups)  # to use with ViTs
-    # elif conf.optimizer == "sgd":
-    #     optimizer = torch.optim.SGD(
-    #         params_groups, lr=0, momentum=0.9
-    #     )  # lr is set by scheduler
-    # elif conf.optimizer == "lars":
-    #     optimizer = utils.LARS(params_groups)  # to use with convnet and large batches
-    # # for mixed precision training
-    # fp16_scaler = None
-    # if conf.use_fp16:
-    #     fp16_scaler = torch.cuda.amp.GradScaler()
-# 
-    # # ============ init schedulers ... ============
-    # lr_schedule = utils.cosine_scheduler(
-    #     conf.lr
-    #     * (conf.batch_size_per_gpu * utils.get_world_size())
-    #     / 256.0,  # linear scaling rule
-    #     conf.min_lr,
-    #     conf.epochs,
-    #     len(data_loader),
-    #     warmup_epochs=conf.warmup_epochs,
-    # )
-    # wd_schedule = utils.cosine_scheduler(
-    #     conf.weight_decay,
-    #     conf.weight_decay_end,
-    #     conf.epochs,
-    #     len(data_loader),
-    # )
-    # # momentum parameter is increased to 1. during training with a cosine schedule
-    # momentum_schedule = utils.cosine_scheduler(
-    #     conf.momentum_teacher, 1, conf.epochs, len(data_loader)
-    # )
-
-    optimizer, lr_schedulers, wd_schedulers, momentum_schedule, fp16_scaler = setup_optimization(
-        student, len(data_loader), conf
+    optimizer, lr_schedulers, wd_schedulers, momentum_schedule, fp16_scaler = (
+        setup_optimization(student, len(data_loader), conf)
     )
 
-    print(f"Loss, optimizer and schedulers ready.")
+    logging.info(f"Loss, optimizer and schedulers ready.")
 
     # ============ setup additional evaluation ===============
-    if conf.do_nct_probing:
-        print(f"Setting up NCT probing...")
-        from probing_nct import NCTProbing
-
-        nct_probe = NCTProbing(
-            conf.batch_size_per_gpu, size=conf.transform.global_crops_size
-        )
+    ssl_evaluator = SSLEvaluator(conf)
 
     # ============ optionally resume training ... ============
     to_restore = {"epoch": 0}
@@ -270,7 +178,7 @@ def train_ibot(conf):
 
     # prefer to resume from latest checkpoint in output directory
     if os.path.exists(p := os.path.join(conf.output_dir, "checkpoint.pth")):
-        print(f"Loading state from {p}")
+        logging.info(f"Loading state from {p}")
         utils.restart_from_checkpoint(
             p,
             run_variables=to_restore,
@@ -283,7 +191,7 @@ def train_ibot(conf):
     elif (load_path := conf.load_from) is not None:
         # otherwise use 'load_from'
         assert os.path.exists(load_path), f"Load path {load_path} does not exist."
-        print(f"Loading state from {load_path}")
+        logging.info(f"Loading state from {load_path}")
         utils.restart_from_checkpoint(
             load_path,
             run_variables=to_restore,
@@ -295,7 +203,7 @@ def train_ibot(conf):
         )
     elif (p := conf.load_model_from) is not None:
         assert os.path.exists(p), f"Load path {p} does not exist."
-        print(f"Loading models from {p}")
+        logging.info(f"Loading models from {p}")
         utils.restart_from_checkpoint(
             p, run_variables=None, student=student, teacher=teacher, ibot_loss=ibot_loss
         )
@@ -303,12 +211,13 @@ def train_ibot(conf):
     start_epoch = to_restore["epoch"]
 
     start_time = time.time()
-    print("Starting iBOT training!")
+    logging.info("Starting iBOT training!")
     for epoch in range(start_epoch, conf.epochs):
         data_loader.sampler.set_epoch(epoch)
         data_loader.dataset.set_epoch(epoch)
 
         # ============ training one epoch of iBOT ... ============
+        logging.info(f"EPOCH {epoch}")
         train_stats = train_one_epoch(
             student,
             teacher,
@@ -340,45 +249,35 @@ def train_ibot(conf):
             utils.save_on_master(
                 save_dict, os.path.join(conf.output_dir, f"checkpoint{epoch:04}.pth")
             )
-        log_stats = {
-            **{f"train_{k}": v for k, v in train_stats.items()},
-            "epoch": epoch,
-        }
 
         # ======== run and log probing results ========
-        if conf.do_nct_probing and ((epoch + 1) % conf.probing_freq == 0):
-            print(f"Running NCT Probing")
-            probing_results = nct_probe.run_probing(
+        if (epoch + 1) % conf.probing_freq == 0:
+            probing_results = ssl_evaluator(
                 teacher_without_ddp,
                 epoch,
                 "cuda",
                 is_main_process=utils.is_main_process(),
             )
-            print(f"Probing results: {probing_results}")
         else:
             probing_results = None
         if probing_results is not None:
-            log_stats.update(probing_results)
-
-        if utils.is_main_process():
-            with (Path(conf.output_dir) / "log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
-                # run.log(log_stats)
+            logging.info(f"Probing results: {probing_results}")
+            wandb.log({"epoch": epoch, **probing_results})
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print("Training time {}".format(total_time_str))
+    logging.info("Training time {}".format(total_time_str))
 
 
 def train_one_epoch(
     student,
     teacher,
-    teacher_without_ddp,
+    teacher_without_ddp: nn.Module,
     ibot_loss,
     data_loader,
     optimizer,
-    lr_schedulers,
-    wd_schedulers,
+    lr_schedulers: list[list[float]],
+    wd_schedulers: list[list[float]],
     momentum_schedule,
     epoch,
     fp16_scaler,
@@ -410,13 +309,17 @@ def train_one_epoch(
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         lrs_and_wds_for_logging = {}
-        for i, (param_group, lr_schedule, wd_schedule) in enumerate(zip(optimizer.param_groups, lr_schedulers, wd_schedulers)):
+        for i, (param_group, lr_schedule, wd_schedule) in enumerate(
+            zip(optimizer.param_groups, lr_schedulers, wd_schedulers)
+        ):
             param_group["lr"] = lr_schedule[it]
             param_group["weight_decay"] = wd_schedule[it]
-            lrs_and_wds_for_logging.update({
-                f'lr_{i}': lr_schedule[it], 
-                f'wd_{i}': wd_schedule[it],
-            })
+            lrs_and_wds_for_logging.update(
+                {
+                    f"lr_{i}": lr_schedule[it],
+                    f"wd_{i}": wd_schedule[it],
+                }
+            )
 
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images]
@@ -449,7 +352,7 @@ def train_one_epoch(
 
         losses_across_batch = utils.concat_all_gather(loss.view(1))
         if any([not math.isfinite(loss_.item()) for loss_ in losses_across_batch]):
-            print("Warning: NaN value encountered in loss")
+            logging.info("Warning: NaN value encountered in loss")
             continue
 
         # log statistics
@@ -505,14 +408,88 @@ def train_one_epoch(
         nmi, ari, fscore, adjacc = eval_pred(real_labels, pred_labels, calc_acc=False)
         # gather the stats from all processes
         metric_logger.synchronize_between_processes()
-        print("NMI: {}, ARI: {}, F: {}, ACC: {}".format(nmi, ari, fscore, adjacc))
-        print("Averaged stats:", metric_logger)
+        logging.info(
+            "NMI: {}, ARI: {}, F: {}, ACC: {}".format(nmi, ari, fscore, adjacc)
+        )
+        logging.info("Averaged stats:", metric_logger)
         return_dict.update({"nmi": nmi, "ari": ari, "fscore": fscore, "adjacc": adjacc})
 
     return return_dict
 
 
-def build_models(conf): ...
+def build_models(conf):
+    # ============ building student and teacher networks ... ============
+    kw = dict(img_size=[conf.transform.global_crops_size])
+    # we changed the name DeiT-S for ViT-S to avoid confusions
+    conf.arch = conf.arch.replace("deit", "vit")
+    # if the network is of hierechical features (i.e. swin_tiny, swin_small, swin_base)
+    if conf.arch == "medsam":
+        student = MedSAMIBot()
+        teacher = MedSAMIBot()
+        embed_dim = 768
+    elif conf.arch in models.__dict__.keys() and "swin" in conf.arch:
+        student = models.__dict__[conf.arch](
+            window_size=conf.window_size,
+            return_all_tokens=True,
+            masked_im_modeling=conf.use_masked_im_modeling,
+            **kw,
+        )
+        teacher = models.__dict__[conf.arch](
+            window_size=conf.window_size,
+            drop_path_rate=0.0,
+            return_all_tokens=True,
+            **kw,
+        )
+        embed_dim = student.num_features
+    # if the network is a vision transformer (i.e. vit_tiny, vit_small, vit_base, vit_large)
+    elif conf.arch in models.__dict__.keys():
+        student = models.__dict__[conf.arch](
+            patch_size=conf.patch_size,
+            drop_path_rate=conf.drop_path,
+            return_all_tokens=True,
+            masked_im_modeling=conf.use_masked_im_modeling,
+            **kw,
+        )
+        teacher = models.__dict__[conf.arch](
+            patch_size=conf.patch_size, return_all_tokens=True, **kw
+        )
+        embed_dim = student.embed_dim
+    elif "resnet" in conf.arch:
+        student: resnet.ResNet = resnet.__dict__[conf.arch]()
+        teacher = resnet.__dict__[conf.arch]()
+        embed_dim = student.fc.weight.shape[1]
+        student.fc = None
+        teacher.fc = None
+        student = src.models.wrappers.ResnetWrapper(student)
+        teacher = src.models.wrappers.ResnetWrapper(teacher)
+    else:
+        logging.info(f"Unknow architecture: {conf.arch}")
+
+    # multi-crop wrapper handles forward with inputs of different resolutions
+    student = utils.MultiCropWrapper(
+        student,
+        iBOTHead(
+            embed_dim,
+            conf.out_dim,
+            patch_out_dim=conf.patch_out_dim,
+            norm=conf.norm_in_head,
+            act=conf.act_in_head,
+            norm_last_layer=conf.norm_last_layer,
+            shared_head=conf.shared_head,
+        ),
+    )
+    teacher = utils.MultiCropWrapper(
+        teacher,
+        iBOTHead(
+            embed_dim,
+            conf.out_dim,
+            patch_out_dim=conf.patch_out_dim,
+            norm=conf.norm_in_head,
+            act=conf.act_in_head,
+            shared_head=conf.shared_head_teacher,
+        ),
+    )
+    return student, teacher
 
 
 def setup_optimization(student, num_iters_per_epoch, conf):
@@ -750,139 +727,121 @@ class iBOTLoss(nn.Module):
         )
 
 
-class DataAugmentationiBOT(object):
-    def __init__(
-        self,
-        global_crops_scale: list[float, float] = (0.14, 1),
-        local_crops_scale: list[float, float] = (0.05, 0.4),
-        global_crops_number: int = 2,
-        local_crops_number: int = 0,
-        global_crops_size: int = 224,
-        local_crops_size: int = 96,
-        jitter_prob: float = 0.8,
-        mean: list[float] = [0.485, 0.456, 0.406],
-        std: list[float] = [0.229, 0.224, 0.225],
-        blur_prob_1: float = 1.0,
-        blur_prob_2: float = 0.1,
-        solarization_prob: float = 0.2,
-        initial_crop_size: int = None,
-        initial_resize_size: int = None,
-    ):
-        self.std = std
-        self.mean = mean
-
-        self.initial_crop = (
-            transforms.RandomCrop(initial_crop_size)
-            if initial_crop_size is not None
-            else lambda x: x
-        )
-        self.initial_resize = (
-            transforms.Resize(
-                (initial_resize_size, initial_resize_size), antialias=True
+class SSLEvaluator:
+    def __init__(self, conf):
+        if conf.do_nct_probing:
+            logging.info(f"Setting up NCT probing...")
+            self.nct_probe = NCTProbing(
+                conf.batch_size_per_gpu, size=conf.transform.global_crops_size
             )
-            if initial_resize_size is not None
-            else lambda x: x
-        )
+        else:
+            self.nct_probe = None
 
-        flip_and_color_jitter = transforms.Compose(
-            [
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomApply(
-                    [
-                        transforms.ColorJitter(
-                            brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1
-                        )
-                    ],
-                    p=jitter_prob,
-                ),
-                transforms.RandomGrayscale(p=0.2),
-            ]
-        )
-        normalize = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Normalize(mean, std),
-            ]
-        )
+        if conf.get('do_clstoken_nct_probing', False):
+            logging.info(f"Setting up patch NCT probing...")
+            self.nct_clstoken_probe = build_linear_probe_for_nct_patches(
+                input_size=conf.transform.global_crops_size,
+                batch_size=conf.batch_size_per_gpu,
+                device="cuda",
+            )
 
-        self.global_crops_number = global_crops_number
-        # transformation for the first global crop
-        self.global_transfo1 = transforms.Compose(
-            [
-                transforms.RandomResizedCrop(
-                    global_crops_size,
-                    scale=global_crops_scale,
-                    interpolation=Image.BICUBIC,
-                ),
-                flip_and_color_jitter,
-                utils.GaussianBlur(p=blur_prob_1),
-                normalize,
-            ]
-        )
-        # transformation for the rest of global crops
-        self.global_transfo2 = transforms.Compose(
-            [
-                transforms.RandomResizedCrop(
-                    global_crops_size,
-                    scale=global_crops_scale,
-                    interpolation=Image.BICUBIC,
-                ),
-                flip_and_color_jitter,
-                utils.GaussianBlur(p=blur_prob_1),
-                utils.Solarization(solarization_prob),
-                normalize,
-            ]
-        )
-        # transformation for the local crops
-        self.local_crops_number = local_crops_number
-        self.local_transfo = transforms.Compose(
-            [
-                transforms.RandomResizedCrop(
-                    local_crops_size,
-                    scale=local_crops_scale,
-                    interpolation=Image.BICUBIC,
-                ),
-                flip_and_color_jitter,
-                utils.GaussianBlur(p=blur_prob_2),
-                normalize,
-            ]
-        )
+    def __call__(self, model: utils.MultiCropWrapper, epoch, device, is_main_process):
+        logging.info(f"Running NCT Probing")
+        probing_results = {}
 
-    def __call__(self, image):
-        image = self.initial_resize(image)
-        image = self.initial_crop(image)
-        crops = []
-        crops.append(self.global_transfo1(image))
-        for _ in range(self.global_crops_number - 1):
-            crops.append(self.global_transfo2(image))
-        for _ in range(self.local_crops_number):
-            crops.append(self.local_transfo(image))
-        return crops
+        if self.nct_probe is not None:
+            train_metrics, val_metrics = self.nct_probe.run_probing(
+                model,
+                epoch,
+                "cuda",
+                is_main_process=utils.is_main_process(),
+            )
+            self._add_metrics_to_dict(
+                probing_results, train_metrics, "train", "probing"
+            )
+            self._add_metrics_to_dict(probing_results, val_metrics, "val", "probing")
 
-    def to_numpy(self, tensor):
-        C, H, W = tensor.shape
-        tensor *= torch.tensor(self.std)[..., None, None]
-        tensor += torch.tensor(self.mean)[..., None, None]
-        return tensor.permute(1, 2, 0).numpy()
+        if self.nct_clstoken_probe is not None:
+            train_metrics, val_metrics = self.nct_clstoken_probe.run_probing(
+                model
+            )
+            self._add_metrics_to_dict(
+                probing_results, train_metrics, "train", "clstoken_probing"
+            )
+            self._add_metrics_to_dict(
+                probing_results, val_metrics, "val", "clstoken_probing"
+            )
+
+        return probing_results
+
+    def _add_metrics_to_dict(self, d, metrics, split, name):
+        d.update({f"{split}_{k}_{name}": v for k, v in metrics.items()})
+
+
+@hydra.main(config_path="conf", config_name="medsam_ibot.yaml", version_base=None)
+def main(conf):
+    if conf.get("wandb_path", None) is not None:
+        api = wandb.Api()
+        run = api.run(conf.wandb_path)
+        conf = OmegaConf.create(run.config)
+        logging.info(f"{run.id} loaded from wandb.")
+
+    rich.print(OmegaConf.to_yaml(conf))
+    output_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
+    checkpoint_dir_symlink_target = os.path.join(output_dir, "checkpoint")
+    checkpoint_dir = conf.output_dir
+    if checkpoint_dir is None: 
+        checkpoint_dir = output_dir 
+        conf.output_dir = output_dir
+    else: 
+        checkpoint_dir = os.path.abspath(conf.output_dir)
+        print(checkpoint_dir)
+        if checkpoint_dir != checkpoint_dir_symlink_target:
+            # sym link the output dir to the checkpoint dir
+            try:
+                os.symlink(
+                    checkpoint_dir, checkpoint_dir_symlink_target, target_is_directory=True
+                )
+            except:
+                pass
+
+    train_ibot(conf)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument(
-        "--config", "-c", default=os.path.join("conf", "main_ibot_defaults.yaml")
-    )
-    parser.add_argument("--help", "-h", action="store_true")
-    args, extras = parser.parse_known_args()
+    main()
 
-    conf = OmegaConf.load(args.config)
-    conf = OmegaConf.merge(conf, OmegaConf.from_cli(extras))
-
-    if args.help:
-        print("========")
-        parser.print_help()
-        print("========")
-        rich.print(OmegaConf.to_yaml(conf))
-        print("========")
-        sys.exit(0)
-
-    train_ibot(conf)
+    # parser = argparse.ArgumentParser(add_help=False)
+    # parser.add_argument(
+    #     "--config", "-c",
+    # )
+    # parser.add_argument(
+    #     "--wandb_path", help='Name of wandb path (path to run in the form `entity/project/run_id`) - if set, will use this id to load the configuration from a wandb run and resume it.'
+    # )
+    #
+    # parser.add_argument("--help", "-h", action="store_true")
+    # args, extras = parser.parse_known_args()
+#
+# if args.wandb_path is not None:
+#     api = wandb.Api()
+#     run = api.run(args.wandb_path)
+#     conf = OmegaConf.create(run.config)
+#     conf.wandb_run_id = run.id
+#
+# elif args.config is not None:
+#     conf = OmegaConf.load(args.config)
+#     conf = OmegaConf.merge(conf, OmegaConf.from_cli(extras))
+# else:
+#     parser.print_help()
+#     sys.exit(1)
+#
+# if args.help:
+#     print("========")
+#     parser.print_help()
+#     print("========")
+#     rich.print(OmegaConf.to_yaml(conf))
+#     print("========")
+#     sys.exit(0)
+# #
+# train_ibot(conf)
+#

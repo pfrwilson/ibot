@@ -597,6 +597,10 @@ def init_distributed_mode(args):
         args.gpu = int(os.environ["LOCAL_RANK"])
     # launched with submitit on a slurm cluster
     elif "SLURM_PROCID" in os.environ:
+        if not "MASTER_ADDR" in os.environ: 
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+        if not "MASTER_PORT" in os.environ: 
+            os.environ["MASTER_PORT"] = "29500"
         args.rank = int(os.environ["SLURM_PROCID"])
         args.gpu = args.rank % torch.cuda.device_count()
     # launched naively with `python main_dino.py`
@@ -616,12 +620,12 @@ def init_distributed_mode(args):
         world_size=args.world_size,
         rank=args.rank,
     )
-
     torch.cuda.set_device(args.gpu)
     print(
         "| distributed init (rank {}): {}".format(args.rank, args.dist_url), flush=True
     )
     dist.barrier()
+
     setup_for_distributed(args.rank == 0)
 
 
@@ -846,6 +850,9 @@ def concat_all_gather(tensor):
     Performs all_gather operation on the provided tensors.
     *** Warning ***: torch.distributed.all_gather has no gradient.
     """
+    if not is_dist_avail_and_initialized():
+        return tensor
+    
     tensors_gather = [
         torch.ones_like(tensor) for _ in range(torch.distributed.get_world_size())
     ]
@@ -1019,21 +1026,6 @@ def compute_map(ranks, gnd, kappas=[]):
     return map, aps, pr, prs
 
 
-class ResnetWrapper(nn.Module):
-    def __init__(self, model: timm.models.ResNet):
-        super().__init__()
-        self.model = model
-
-    def forward(self, x, mask=None):
-        feature_map = self.model.forward_features(x)
-        b, c, h, w = feature_map.shape
-        avgpool = self.model.global_pool(feature_map)
-
-        feature_map_as_tokens = feature_map.reshape(b, c, h * w).permute(0, 2, 1)
-        b, c = avgpool.shape
-        avgpool = avgpool[:, None, :]
-
-        return torch.cat([avgpool, feature_map_as_tokens], dim=1)
 
 
 class MyClass:

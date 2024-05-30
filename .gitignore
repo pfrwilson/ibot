@@ -13,3 +13,7 @@ pics/
 !.gitignore
 *.log
 scratch.*
+outputs/
+experiment/
+multirun/
+pyrightconfig.json

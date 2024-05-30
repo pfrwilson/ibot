@@ -1,5 +1,5 @@
 # model
-arch: medsam
+arch: vit_small
 patch_size: 16
 window_size: 7
 out_dim: 8192
@@ -7,7 +7,7 @@ patch_out_dim: 8192
 shared_head: false
 shared_head_teacher: true
 norm_last_layer: true
-momentum_teacher: 0.9995 # reduced to account for smaller batch size
+momentum_teacher: 0.996
 norm_in_head: null
 act_in_head: gelu
 use_masked_im_modeling: true
@@ -26,14 +26,14 @@ teacher_patch_temp: 0.07
 warmup_teacher_temp_epochs: 30
 use_fp16: true
 clip_grad: 3.0
-batch_size_per_gpu: 1
+batch_size_per_gpu: 128
 epochs: 100
 freeze_last_layer: 1
 
 optimizer: 
   type: adamw 
   main: # configuration of main parameter group 
-    base_lr: 1e-4
+    base_lr: 0.0005
     frozen_epochs: 0
     warmup_epochs: 10
     weight_decay: 0.04
@@ -60,9 +60,9 @@ gpu: 0
 
 # other options
 do_unsupervised_eval: false
-do_nct_probing: true
-do_clstoken_nct_probing: true
-probing_freq: 5
+do_nct_probing: false
+do_clstoken_nct_probing: false
+probing_freq: 1
 wandb_run_id: null
 
 transform:
@@ -76,7 +76,7 @@ transform:
   local_crops_number: 0
   global_crops_size: 224
   local_crops_size: 96
-  jitter_prob: 0
+  jitter_prob: 0.8
   mean:
   - 0.485
   - 0.456
@@ -85,9 +85,9 @@ transform:
   - 0.229
   - 0.224
   - 0.225
-  blur_prob_1: 0
-  blur_prob_2: 0
-  solarization_prob: 0
+  blur_prob_1: 1.0
+  blur_prob_2: 0.1
+  solarization_prob: 0.2
   initial_crop_size: null
   initial_resize_size: null
 

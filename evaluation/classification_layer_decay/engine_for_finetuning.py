@@ -12,7 +12,7 @@ https://github.com/microsoft/unilm/tree/master/beit
 import math
 import sys
 import torch
-import utils
+import src.utils as utils
 
 from typing import Iterable, Optional
 from timm.data import Mixup

@@ -12,7 +12,7 @@ import torch
 import torch.distributed as dist
 import numpy as np
 import models
-import utils
+import src.utils as utils
 
 from PIL import ImageFile
 from tqdm import tqdm
