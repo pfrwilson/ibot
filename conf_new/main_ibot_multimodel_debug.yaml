@@ -1,0 +1,10 @@
+evaluation: 
+  do_nct_probing: true
+  do_clstoken_nct_probing: false
+  do_register_probing: false
+  probing_freq: 1
+
+debug: true
+
+model: 
+  use_masked_im_modeling: False

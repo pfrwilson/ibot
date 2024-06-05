@@ -23,9 +23,11 @@ export WORLD_SIZE=$SLURM_NTASKS
 
 export WANDB_RUN_ID=$SLURM_JOB_ID
 export WANDB_RESUME='ALLOW'
+export WANDB_NAME='ibot-multimodel-control'
 export TQDM_DISABLE='True'
+
 
 IMAGENET_DATA=/scratch/ssd004/datasets/imagenet256/train 
 MICROUS_DATA=/ssd005/projects/exactvu_pca/unlabelled_microus_png
 
-python main_ibot.py -c conf_new/main_ibot.yaml --overrides output_dir=$EXPERIMENT_DIR 
+python main_ibot_multimodel.py -c conf_new/main_ibot_multimodel.yaml --overrides output_dir=$EXPERIMENT_DIR loss.cnn_loss_weight=0 loss.cross_loss_weight=0

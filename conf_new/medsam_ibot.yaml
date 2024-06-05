@@ -1,41 +1,51 @@
-# MEDSAM IBOT
 # model
+backbone: 
 arch: medsam
+backbone_kwargs: 
+  freeze_pos_embed: true
+  # img_size: ${transform.global_crops_size}
+drop_path: 0.1
+
 patch_size: 16
-window_size: 7
+
+# head
 out_dim: 8192
 patch_out_dim: 8192
 shared_head: false
 shared_head_teacher: true
 norm_last_layer: true
-momentum_teacher: 0.9995 # reduced to account for smaller batch size
 norm_in_head: null
 act_in_head: gelu
+
 use_masked_im_modeling: true
+
+# masking parameters
 pred_ratio: 0.3
 pred_ratio_var: 0
 pred_shape: block
 pred_start_epoch: 0
-lambda1: 1.0 # loss weights
-lambda2: 1.0 
+
+# loss weights
+lambda1: 1.0 
+lambda2: 1.0
 
 # training
+momentum_teacher: 0.996
 warmup_teacher_temp: 0.04
 teacher_temp: 0.04
 warmup_teacher_patch_temp: 0.04
 teacher_patch_temp: 0.07
 warmup_teacher_temp_epochs: 30
-
 use_fp16: true
 clip_grad: 3.0
-batch_size_per_gpu: 1
-epochs: 100
+batch_size_per_gpu: 16
+epochs: 500
 freeze_last_layer: 1
 
-optimizer: 
-  type: adamw 
-  main: # configuration of main parameter group 
-    base_lr: 1e-5
+optimizer:
+  type: adamw
+  main: # configuration of main parameter group
+    base_lr: 1e-4
     frozen_epochs: 0
     warmup_epochs: 10
     weight_decay: 0.04
@@ -45,44 +55,50 @@ optimizer:
 # paths
 load_from: null
 load_model_from: null
-drop_path: 0.1
 data_path: /ssd005/projects/exactvu_pca/unlabelled_microus_png
-output_dir: .
 
 saveckp_freq: 40
 seed: 0
 num_workers: 10
+
+# distributed
 dist_url: env://
-local_rank: 0
 
 # other options
 do_unsupervised_eval: false
 do_nct_probing: true
-probing_freq: 5
+do_clstoken_nct_probing: true
+probing_freq: 10
 wandb_run_id: null
 
 transform:
   global_crops_scale:
-  - 0.14
-  - 1
+    - 0.14
+    - 1
   local_crops_scale:
-  - 0.05
-  - 0.4
+    - 0.05
+    - 0.4
   global_crops_number: 2
   local_crops_number: 0
   global_crops_size: 224
   local_crops_size: 96
-  jitter_prob: 0
+  jitter_prob: 0.0
   mean:
-  - 0.485
-  - 0.456
-  - 0.406
+    - 0.485
+    - 0.456
+    - 0.406
   std:
-  - 0.229
-  - 0.224
-  - 0.225
-  blur_prob_1: 0
-  blur_prob_2: 0
+    - 0.229
+    - 0.224
+    - 0.225
+  blur_prob_1: 0.0
+  blur_prob_2: 0.0
   solarization_prob: 0
-  initial_crop_size: null
+  initial_crop_size: 768
   initial_resize_size: null
+
+wandb:
+  name: long_run_conv_patch_emb
+
+world_size: null 
+rank: null 

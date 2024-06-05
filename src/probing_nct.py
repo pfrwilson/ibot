@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Callable, Protocol
 import torch
 import numpy as np
 from torch import nn
@@ -10,6 +10,13 @@ from torchvision.tv_tensors import Image, Mask
 from torch.utils.data.distributed import DistributedSampler
 from torch import distributed as dist
 import time
+from .models.base import BackboneNetwork
+
+
+class FeatureMapFunction(Protocol): 
+    def __call__(self, model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        """Takes the model, and the input image, and returns the image feature map."""
+        raise NotImplementedError()
 
 
 class NCTProbing:
@@ -42,15 +49,15 @@ class NCTProbing:
             self.train_ds, batch_size=batch_size, num_workers=4, sampler=sampler
         )
     
-    def run_probing(self, model, epoch, device, is_main_process=True):
-        return run_probing(model, self.train_loader, epoch, device, is_main_process)
+    def run_probing(self, model: nn.Module, epoch, device, get_feature_map_fn: FeatureMapFunction, is_main_process=True):
+        return _run_nct_probing(model, self.train_loader, epoch, device, get_feature_map_fn, is_main_process)
 
 
 @torch.no_grad()
-def run_probing(model, loader, epoch: int, device: str, is_main_process=True) -> tuple[dict[str, Any], dict[str, Any]]:
+def _run_nct_probing(model: nn.Module, loader, epoch: int, device: str, get_feature_map_fn: FeatureMapFunction, is_main_process=True, ):
     model.eval()
 
-    train_outputs = extract_all_data(model, loader, device)
+    train_outputs = _extract_all_data(model, loader, device, get_feature_map_fn)
 
     if is_main_process: 
 
@@ -112,19 +119,19 @@ def run_probing(model, loader, epoch: int, device: str, is_main_process=True) ->
 
 
 @torch.no_grad()
-def extract_all_data(model, loader, device):
+def _extract_all_data(model: nn.Module, loader, device, get_feature_map_fn: FeatureMapFunction):
 
     outputs = {}
 
     model.eval()
 
     # Collect all the labels and masks from training and validation
-    def extract_features(batch, model, device):
+    def extract_features(batch, model: nn.Module, device):
         bmode = batch["bmode"].to(device)
 
-        tokens, (cls_prediction, patch_prediction) = model([bmode], return_backbone_feat=True)
-        image_features = tokens_to_feature_map(tokens, cls_is_included=True)
-        patch_prediction = tokens_to_feature_map(patch_prediction, cls_is_included=False)
+        image_features = get_feature_map_fn(model, bmode)
+
+        image_features = model.get_feature_map(bmode)
         # image_features = model.image_encoder_wrapped.get_image_features(
         #     bmode
         # )  # B, C, H, W
@@ -153,11 +160,9 @@ def extract_all_data(model, loader, device):
         from einops import rearrange
 
         image_features = rearrange(image_features, "b c h w -> b h w c")
-        patch_prediction = rearrange(patch_prediction, "b c h w -> b h w c")
         batch_idx = rearrange(batch_idx, "b c h w -> b h w c")
 
         image_features = image_features[mask]
-        patch_prediction = patch_prediction[mask]
         batch_idx = batch_idx[mask].view(-1).cpu().numpy()
 
         def map_batch_level_feature_to_patch_level_feature(
@@ -189,11 +194,11 @@ def extract_all_data(model, loader, device):
             patient_id, batch_idx
         )
 
-        return image_features, patch_prediction, cancer, involvement, grade_group, core_id, patient_id
+        return image_features, cancer, involvement, grade_group, core_id, patient_id
 
     for batch in tqdm(loader, desc="Extracting features"):
 
-        image_features, patch_prediction, cancer, involvement, grade_group, core_id, patient_id = (
+        image_features, cancer, involvement, grade_group, core_id, patient_id = (
             extract_features(batch, model, device)
         )
         outputs.setdefault("features", []).append(image_features)

@@ -22,12 +22,12 @@ class DataAugmentation:
     local_crops_number: int = 0
     global_crops_size: int = 224
     local_crops_size: int = 96
-    jitter_prob: float = 0.8
+    jitter_prob: float = 0.0
     mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
     std: tuple[float, float, float] = (0.229, 0.224, 0.225)
-    blur_prob_1: float = 1.0
-    blur_prob_2: float = 0.1
-    solarization_prob: float = 0.2
+    blur_prob_1: float = 0.0
+    blur_prob_2: float = 0.0
+    solarization_prob: float = 0.0
     initial_crop_size: int | None = None
     initial_resize_size: int | None = None
 
@@ -126,4 +126,6 @@ class DataAugmentation:
         tensor *= torch.tensor(self.std)[..., None, None]
         tensor += torch.tensor(self.mean)[..., None, None]
         return tensor.permute(1, 2, 0).numpy()
+
+
 

@@ -602,17 +602,15 @@ def init_distributed_mode(args):
         if not "MASTER_PORT" in os.environ: 
             os.environ["MASTER_PORT"] = "29500"
         args.rank = int(os.environ["SLURM_PROCID"])
+        args.world_size = int(os.environ["SLURM_NTASKS"])
         args.gpu = args.rank % torch.cuda.device_count()
     # launched naively with `python main_dino.py`
     # we manually add MASTER_ADDR and MASTER_PORT to env variables
-    elif torch.cuda.is_available():
+    else:
         print("Will run the code on one GPU.")
         args.rank, args.gpu, args.world_size = 0, 0, 1
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
-    else:
-        print("Does not support training without GPU.")
-        sys.exit(1)
 
     dist.init_process_group(
         backend="nccl",
@@ -768,59 +766,6 @@ def create_ds_config(args):
         }
 
         writer.write(json.dumps(ds_config, indent=2))
-
-
-class MultiCropWrapper(nn.Module):
-    """
-    Perform forward pass separately on each resolution input.
-    The inputs corresponding to a single resolution are clubbed and single
-    forward is run on the same resolution inputs. Hence we do several
-    forward passes = number of different resolutions used. We then
-    concatenate all the output features and run the head forward on these
-    concatenated features.
-    """
-
-    def __init__(self, backbone, head=None):
-        super(MultiCropWrapper, self).__init__()
-        # disable layers dedicated to ImageNet labels classification
-        backbone.fc, backbone.head = nn.Identity(), nn.Identity()
-        self.backbone = backbone
-        if head is None:
-            self.head = nn.Identity()
-        else:
-            self.head = head
-
-    def forward(self, x, mask=None, return_backbone_feat=False, **kwargs):
-        # convert to list
-        if not isinstance(x, list):
-            x = [x]
-            mask = [mask] if mask is not None else None
-        idx_crops = torch.cumsum(
-            torch.unique_consecutive(
-                torch.tensor([inp.shape[-1] for inp in x]),
-                return_counts=True,
-            )[1],
-            0,
-        )
-        start_idx = 0
-        for end_idx in idx_crops:
-            inp_x = torch.cat(x[start_idx:end_idx])
-
-            if mask is not None:
-                inp_m = torch.cat(mask[start_idx:end_idx])
-                kwargs.update(dict(mask=inp_m))
-
-            _out = self.backbone(inp_x, **kwargs)
-            if start_idx == 0:
-                output = _out
-            else:
-                output = torch.cat((output, _out))
-            start_idx = end_idx
-        # Run the head forward on the concatenated features.
-        output_ = self.head(output)
-        if return_backbone_feat:
-            return output, output_
-        return output_
 
 
 def get_params_groups(model):
@@ -1204,6 +1149,17 @@ class CosineAnnealingLRCalculaterWarmRestartsWithWarmupAndFrozenEpochs(
             niter_per_ep,
             CosineScheduleWithWarmRestarts(num_restarts, restart_factors),
         )
+
+
+def pull_conf_from_wandb(wandb_path): 
+    import wandb
+    from omegaconf import OmegaConf
+    # resume from wandb
+    api = wandb.Api()
+    run = api.run(wandb_path)
+    run_conf = OmegaConf.create(run.config)
+    print(f"{run.id} loaded from wandb.")
+    return run_conf
 
 
 if __name__ == "__main__":

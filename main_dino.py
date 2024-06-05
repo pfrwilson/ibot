@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import argparse
-from dataclasses import dataclass, field
 import os
 import sys
 import datetime
@@ -20,6 +18,9 @@ import time
 import math
 import json
 from pathlib import Path
+from dataclasses import asdict
+import simple_parsing as argparse
+from simple_parsing import field
 
 import numpy as np
 from PIL import Image
@@ -30,59 +31,122 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
+import wandb
 
-from src.transform import DataAugmentation
-import src.utils as utils
+from src import utils
 from src.models import vision_transformer as vits
-from src.models.head import DINOHead
-import dotenv
-from rich_argparse import ArgumentDefaultsRichHelpFormatter
-from simple_parsing import ArgumentParser
+from src.transform import DataAugmentation
+from src.ssl_evaluation import SSLEvaluator
+from dotenv import load_dotenv
+from src.models import build_backbones
 
-dotenv.load_dotenv()
+load_dotenv()
 
-torchvision_archs = sorted(
-    name
-    for name in torchvision_models.__dict__
-    if name.islower()
-    and not name.startswith("__")
-    and callable(torchvision_models.__dict__[name])
-)
+
+from dataclasses import dataclass, field
+
+
+class MultiCropWrapper(nn.Module):
+    """
+    Perform forward pass separately on each resolution input.
+    The inputs corresponding to a single resolution are clubbed and single
+    forward is run on the same resolution inputs. Hence we do several
+    forward passes = number of different resolutions used. We then
+    concatenate all the output features and run the head forward on these
+    concatenated features.
+    """
+    def __init__(self, backbone, head):
+        super(MultiCropWrapper, self).__init__()
+        # disable layers dedicated to ImageNet labels classification
+        backbone.fc, backbone.head = nn.Identity(), nn.Identity()
+        self.backbone = backbone
+        self.head = head
+
+    def forward(self, x):
+        # convert to list
+        if not isinstance(x, list):
+            x = [x]
+        idx_crops = torch.cumsum(torch.unique_consecutive(
+            torch.tensor([inp.shape[-1] for inp in x]),
+            return_counts=True,
+        )[1], 0)
+        start_idx, output = 0, torch.empty(0).to(x[0].device)
+        for end_idx in idx_crops:
+            _out = self.backbone(torch.cat(x[start_idx: end_idx]))
+            # The output is a tuple with XCiT model. See:
+            # https://github.com/facebookresearch/xcit/blob/master/xcit.py#L404-L405
+            if isinstance(_out, tuple):
+                _out = _out[0]
+            # accumulate outputs
+            output = torch.cat((output, _out))
+            start_idx = end_idx
+        # Run the head forward on the concatenated features.
+        return self.head(output)
 
 
 @dataclass
 class Args:
-    """Configuration for dino training"""
+    """Training arguments"""
 
+    output_dir: str = "."  # Path to save logs and checkpoints
+    data_path: str = os.environ['MICROUS_DATA']  # Path to the training data
+
+    # Model parameters
     arch: str = "vit_small"  # Name of architecture to train
     patch_size: int = 16  # Size in pixels of input square patches
-    out_dim: int = 65536  # Dimensionality of the DINO head output
-    norm_last_layer: bool = True  # Whether or not to weight normalize the last layer of the DINO head
+    out_dim: int = 8192  # Dimensionality of the DINO head output
+    norm_last_layer: bool = (
+        True  # Whether or not to weight normalize the last layer of the DINO head
+    )
     momentum_teacher: float = 0.996  # Base EMA parameter for teacher update
-    use_bn_in_head: bool = False  # Whether to use batch normalizations in projection head
+    use_bn_in_head: bool = (
+        False  # Whether to use batch normalizations in projection head
+    )
+
+    # Temperature teacher parameters
     warmup_teacher_temp: float = 0.04  # Initial value for the teacher temperature
-    teacher_temp: float = 0.04  # Final value of the teacher temperature
-    warmup_teacher_temp_epochs: int = 0  # Number of warmup epochs for the teacher temperature
+    teacher_temp: float = (
+        0.04  # Final value (after linear warmup) of the teacher temperature
+    )
+    warmup_teacher_temp_epochs: int = (
+        0  # Number of warmup epochs for the teacher temperature
+    )
+
+    # Training/Optimization parameters
     use_fp16: bool = True  # Whether or not to use half precision for training
     weight_decay: float = 0.04  # Initial value of the weight decay
     weight_decay_end: float = 0.4  # Final value of the weight decay
     clip_grad: float = 3.0  # Maximal parameter gradient norm if using gradient clipping
     batch_size_per_gpu: int = 64  # Per-GPU batch-size
     epochs: int = 100  # Number of epochs of training
-    freeze_last_layer: int = 1  # Number of epochs during which we keep the output layer fixed
+    freeze_last_layer: int = (
+        1  # Number of epochs during which we keep the output layer fixed
+    )
     lr: float = 0.0005  # Learning rate at the end of linear warmup
     warmup_epochs: int = 10  # Number of epochs for the linear learning-rate warm up
     min_lr: float = 1e-6  # Target LR at the end of optimization
     optimizer: str = "adamw"  # Type of optimizer
     drop_path_rate: float = 0.1  # stochastic depth rate
-    augmentation: DataAugmentation = field(default_factory=DataAugmentation)  # Data augmentation
-    data_path: str = os.environ["DATA_PATH"]  # Path to the ImageNet training data
-    output_dir: str = "."  # Path to save logs and checkpoints
+
+    # Multi-crop parameters
+    transform: DataAugmentation = field(default_factory=DataAugmentation)
+
+    evaluation_freq: int =5  # Frequency of the SSL evaluation
+
+    # Misc
     saveckp_freq: int = 20  # Save checkpoint every x epochs
     seed: int = 0  # Random seed
     num_workers: int = 10  # Number of data loading workers per GPU
     dist_url: str = "env://"  # url used to set up distributed training
     local_rank: int = 0  # Please ignore and do not set this argument
+    gpu: int | None = None
+
+
+def get_args_parser():
+    parser = argparse.ArgumentParser("DINO")
+
+    parser.add_arguments(Args, dest="args")
+    return parser
 
 
 def train_dino(args: Args):
@@ -94,9 +158,11 @@ def train_dino(args: Args):
     )
     cudnn.benchmark = True
 
-    # ============ preparing data ... ============
-    transform = args.augmentation
+    if utils.is_main_process(): 
+        wandb.init(project='ibot', config=asdict(args))
 
+    # ============ preparing data ... ============
+    transform = args.transform
     dataset = datasets.ImageFolder(args.data_path, transform=transform)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
@@ -109,76 +175,12 @@ def train_dino(args: Args):
     )
     print(f"Data loaded: there are {len(dataset)} images.")
 
-    # ============ building student and teacher networks ... ============
-    # we changed the name DeiT-S for ViT-S to avoid confusions
-    args.arch = args.arch.replace("deit", "vit")
-    # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
-    if args.arch in vits.__dict__.keys():
-        student = vits.__dict__[args.arch](
-            patch_size=args.patch_size,
-            drop_path_rate=args.drop_path_rate,  # stochastic depth
-        )
-        teacher = vits.__dict__[args.arch](patch_size=args.patch_size)
-        embed_dim = student.embed_dim
-    # if the network is a XCiT
-    elif args.arch in torch.hub.list("facebookresearch/xcit:main"):
-        student = torch.hub.load(
-            "facebookresearch/xcit:main",
-            args.arch,
-            pretrained=False,
-            drop_path_rate=args.drop_path_rate,
-        )
-        teacher = torch.hub.load(
-            "facebookresearch/xcit:main", args.arch, pretrained=False
-        )
-        embed_dim = student.embed_dim
-    # otherwise, we check if the architecture is in torchvision models
-    elif args.arch in torchvision_models.__dict__.keys():
-        student = torchvision_models.__dict__[args.arch]()
-        teacher = torchvision_models.__dict__[args.arch]()
-        embed_dim = student.fc.weight.shape[1]
-    else:
-        print(f"Unknow architecture: {args.arch}")
-
-    # multi-crop wrapper handles forward with inputs of different resolutions
-    student = utils.MultiCropWrapper(
-        student,
-        DINOHead(
-            embed_dim,
-            args.out_dim,
-            use_bn=args.use_bn_in_head,
-            norm_last_layer=args.norm_last_layer,
-        ),
-    )
-    teacher = utils.MultiCropWrapper(
-        teacher,
-        DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
-    )
-    # move networks to gpu
-    student, teacher = student.cuda(), teacher.cuda()
-    # synchronize batch norms (if any)
-    if utils.has_batchnorms(student):
-        student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
-        teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
-
-        # we need DDP wrapper to have synchro batch norms working...
-        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
-        teacher_without_ddp = teacher.module
-    else:
-        # teacher_without_ddp and teacher are the same thing
-        teacher_without_ddp = teacher
-    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
-    # teacher and student start with the same weights
-    teacher_without_ddp.load_state_dict(student.module.state_dict())
-    # there is no backpropagation through the teacher, so no need for gradients
-    for p in teacher.parameters():
-        p.requires_grad = False
-    print(f"Student and Teacher are built: they are both {args.arch} network.")
+    student, teacher, teacher_without_ddp = build_models(args)
 
     # ============ preparing loss ... ============
     dino_loss = DINOLoss(
         args.out_dim,
-        args.local_crops_number
+        args.transform.local_crops_number
         + 2,  # total number of crops = 2 global crops + local_crops_number
         args.warmup_teacher_temp,
         args.teacher_temp,
@@ -199,7 +201,7 @@ def train_dino(args: Args):
     # for mixed precision training
     fp16_scaler = None
     if args.use_fp16:
-        fp16_scaler = torch.cuda.amp.GradScaler()
+        fp16_scaler = torch.cuda.amp.GradScaler() #type: ignore
 
     # ============ init schedulers ... ============
     lr_schedule = utils.cosine_scheduler(
@@ -222,6 +224,14 @@ def train_dino(args: Args):
         args.momentum_teacher, 1, args.epochs, len(data_loader)
     )
     print(f"Loss, optimizer and schedulers ready.")
+
+    # ============ ssl evaluator ... ============
+    ssl_evaluator = SSLEvaluator(
+        do_nct_probing=True,
+        do_clstoken_nct_probing=True,
+        batch_size_per_gpu=args.batch_size_per_gpu,
+        global_crops_size=args.transform.global_crops_size,
+    )
 
     # ============ optionally resume training ... ============
     to_restore = {"epoch": 0}
@@ -263,7 +273,7 @@ def train_dino(args: Args):
             "teacher": teacher.state_dict(),
             "optimizer": optimizer.state_dict(),
             "epoch": epoch + 1,
-            "args": args,
+            "args": asdict(args),
             "dino_loss": dino_loss.state_dict(),
         }
         if fp16_scaler is not None:
@@ -278,8 +288,17 @@ def train_dino(args: Args):
             "epoch": epoch,
         }
         if utils.is_main_process():
-            with (Path(args.output_dir) / "log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
+            wandb.log(log_stats)
+            # with (Path(args.output_dir) / "log.txt").open("a") as f:
+            #     f.write(json.dumps(log_stats) + "\n")
+
+        # ============ evaluation ... ============
+        if epoch % args.evaluation_freq == 0: 
+            metrics = ssl_evaluator(teacher_without_ddp, epoch, 'cuda', utils.is_main_process()) #type: ignore
+            if utils.is_main_process():
+                metrics['epoch'] = epoch
+                wandb.log(metrics)
+
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print("Training time {}".format(total_time_str))
@@ -297,7 +316,7 @@ def train_one_epoch(
     momentum_schedule,
     epoch,
     fp16_scaler,
-    args,
+    args: Args,
 ):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = "Epoch: [{}/{}]".format(epoch, args.epochs)
@@ -312,7 +331,7 @@ def train_one_epoch(
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images]
         # teacher and student forward passes + compute dino loss
-        with torch.cuda.amp.autocast(fp16_scaler is not None):
+        with torch.cuda.amp.autocast(fp16_scaler is not None): #type: ignore
             teacher_output = teacher(
                 images[:2]
             )  # only the 2 global views pass through the teacher
@@ -320,7 +339,7 @@ def train_one_epoch(
             loss = dino_loss(student_output, teacher_output, epoch)
 
         if not math.isfinite(loss.item()):
-            print("Loss is {}, stopping training".format(loss.item()), force=True)
+            print("Loss is {}, stopping training".format(loss.item()))
             sys.exit(1)
 
         # student update
@@ -356,10 +375,54 @@ def train_one_epoch(
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
+
+        if utils.is_main_process():
+            wandb.log({"loss": loss.item(), "lr": optimizer.param_groups[0]["lr"], "wd": optimizer.param_groups[0]["weight_decay"]})
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+
+def build_models(args: Args): 
+    student, teacher, embed_dim = build_backbones(args.arch, args.patch_size, args.drop_path_rate)
+
+    # multi-crop wrapper handles forward with inputs of different resolutions
+    student = MultiCropWrapper(
+        student,
+        DINOHead(
+            embed_dim,
+            args.out_dim,
+            use_bn=args.use_bn_in_head,
+            norm_last_layer=args.norm_last_layer,
+        ),
+    )
+    teacher = MultiCropWrapper(
+        teacher,
+        DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
+    )
+    # move networks to gpu
+    student, teacher = student.cuda(), teacher.cuda()
+    # synchronize batch norms (if any)
+    if utils.has_batchnorms(student):
+        student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
+        teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
+
+        # we need DDP wrapper to have synchro batch norms working...
+        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
+        teacher_without_ddp = teacher.module
+    else:
+        # teacher_without_ddp and teacher are the same thing
+        teacher_without_ddp = teacher
+    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
+    # teacher and student start with the same weights
+    teacher_without_ddp.load_state_dict(student.module.state_dict())
+    # there is no backpropagation through the teacher, so no need for gradients
+    for p in teacher.parameters():
+        p.requires_grad = False
+    print(f"Student and Teacher are built: they are both {args.arch} network.")
+    return student, teacher, teacher_without_ddp
 
 
 class DINOLoss(nn.Module):
@@ -431,14 +494,113 @@ class DINOLoss(nn.Module):
         )
 
 
+class DataAugmentationDINO(object):
+    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number):
+        flip_and_color_jitter = transforms.Compose(
+            [
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomApply(
+                    [
+                        transforms.ColorJitter(
+                            brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1
+                        )
+                    ],
+                    p=0.8,
+                ),
+                transforms.RandomGrayscale(p=0.2),
+            ]
+        )
+        normalize = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+            ]
+        )
+
+        # first global crop
+        self.global_transfo1 = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(
+                    224, scale=global_crops_scale, interpolation=Image.BICUBIC
+                ),
+                flip_and_color_jitter,
+                utils.GaussianBlur(1.0),
+                normalize,
+            ]
+        )
+        # second global crop
+        self.global_transfo2 = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(
+                    224, scale=global_crops_scale, interpolation=Image.BICUBIC
+                ),
+                flip_and_color_jitter,
+                utils.GaussianBlur(0.1),
+                utils.Solarization(0.2),
+                normalize,
+            ]
+        )
+        # transformation for the local small crops
+        self.local_crops_number = local_crops_number
+        self.local_transfo = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(
+                    96, scale=local_crops_scale, interpolation=Image.BICUBIC
+                ),
+                flip_and_color_jitter,
+                utils.GaussianBlur(p=0.5),
+                normalize,
+            ]
+        )
+
+    def __call__(self, image):
+        crops = []
+        crops.append(self.global_transfo1(image))
+        crops.append(self.global_transfo2(image))
+        for _ in range(self.local_crops_number):
+            crops.append(self.local_transfo(image))
+        return crops
+
+
+class DINOHead(nn.Module):
+    def __init__(self, in_dim, out_dim, use_bn=False, norm_last_layer=True, nlayers=3, hidden_dim=2048, bottleneck_dim=256):
+        super().__init__()
+        nlayers = max(nlayers, 1)
+        if nlayers == 1:
+            self.mlp = nn.Linear(in_dim, bottleneck_dim)
+        else:
+            layers: list[nn.Module] = [nn.Linear(in_dim, hidden_dim)]
+            if use_bn:
+                layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.GELU())
+            for _ in range(nlayers - 2):
+                layers.append(nn.Linear(hidden_dim, hidden_dim))
+                if use_bn:
+                    layers.append(nn.BatchNorm1d(hidden_dim))
+                layers.append(nn.GELU())
+            layers.append(nn.Linear(hidden_dim, bottleneck_dim))
+            self.mlp = nn.Sequential(*layers)
+        self.apply(self._init_weights)
+        self.last_layer = nn.utils.weight_norm(nn.Linear(bottleneck_dim, out_dim, bias=False))
+        self.last_layer.weight_g.data.fill_(1)
+        if norm_last_layer:
+            self.last_layer.weight_g.requires_grad = False
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            utils.trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        x = self.mlp(x)
+        x = nn.functional.normalize(x, dim=-1, p=2)
+        x = self.last_layer(x)
+        return x
+
+
 if __name__ == "__main__":
-    # parser = ArgumentParser(
-    #     "DINO",
-    #     parents=[get_args_parser()],
-    #     formatter_class=ArgumentDefaultsRichHelpFormatter,
-    # )
-    parser = ArgumentParser()
-    parser.add_arguments(Args, dest='args')
-    args: Args = parser.parse_args().args
+    parser = get_args_parser()
+    args = parser.parse_args().args
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     train_dino(args)

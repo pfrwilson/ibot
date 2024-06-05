@@ -11,8 +11,9 @@ https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision
 """
 
 import math
-from typing import Sequence
+from typing import Callable, Sequence
 from unittest.mock import patch
+from warnings import warn
 import torch
 import torch.nn as nn
 
@@ -21,6 +22,7 @@ from src.utils import trunc_normal_
 from timm.models.registry import register_model
 from einops.layers.torch import Rearrange
 from einops import pack, unpack
+from .base import BackboneNetwork
 
 
 def pair(obj):
@@ -42,6 +44,17 @@ def drop_path(x, drop_prob: float = 0.0, training: bool = False):
     random_tensor.floor_()  # binarize
     output = x.div(keep_prob) * random_tensor
     return output
+
+
+def posemb_sincos_2d(h, w, dim, temperature: int = 10000, dtype = torch.float32):
+    y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
+    assert (dim % 4) == 0, "feature dimension must be multiple of 4 for sincos emb"
+    omega = torch.arange(dim // 4) / (dim // 4 - 1)
+    omega = 1.0 / (temperature ** omega)
+    y = y.flatten()[:, None] * omega[None, :]
+    x = x.flatten()[:, None] * omega[None, :]
+    pe = torch.cat((x.sin(), x.cos(), y.sin(), y.cos()), dim=1)
+    return pe.type(dtype)
 
 
 class DropPath(nn.Module):
@@ -178,11 +191,31 @@ class Block(nn.Module):
         return x
 
 
-class PatchEmbed(nn.Module):
+class BasePatchEmbed(nn.Module):
+    def __init__(self, img_size, patch_size, in_chans):
+        super().__init__()
+        num_patches = (img_size // patch_size) * (img_size // patch_size)
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = num_patches
+
+    def forward(self, x):
+        """
+        Turns image to patch tokens.
+
+        Args:
+            x: Tensor - B, C, H, W image
+
+        Returns:
+            Tensor - B, C, nPatchesH, nPatchesW patch embeddings.
+        """
+
+
+class PatchEmbed(BasePatchEmbed):
     """Image to Patch Embedding"""
 
     def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
-        super().__init__()
+        super().__init__(img_size, patch_size, in_chans)
         num_patches = (img_size // patch_size) * (img_size // patch_size)
         self.img_size = img_size
         self.patch_size = patch_size
@@ -197,9 +230,9 @@ class PatchEmbed(nn.Module):
         return self.proj(x)
 
 
-class FFTPatchEmbed(nn.Module):
+class FFTPatchEmbed(BasePatchEmbed):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
-        super().__init__()
+        super().__init__(img_size, patch_size, in_chans)
         num_patches = (img_size // patch_size) * (img_size // patch_size)
         self.img_size = img_size
         self.patch_size = patch_size
@@ -236,9 +269,9 @@ class FFTPatchEmbed(nn.Module):
         return proj.permute(0, 3, 1, 2)
 
 
-class FFTPatchEmbedV2(nn.Module):
+class FFTPatchEmbedV2(BasePatchEmbed):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
-        super().__init__()
+        super().__init__(img_size, patch_size, in_chans)
 
         image_height, image_width = pair(img_size)
         patch_height, patch_width = pair(patch_size)
@@ -269,43 +302,117 @@ class FFTPatchEmbedV2(nn.Module):
                 "b c (h p1) (w p2) -> b (h w) (c p1 p2)",
                 p1=patch_height,
                 p2=patch_width,
-                c=in_chans
+                c=in_chans,
             ),
             nn.LayerNorm(patch_dim),
-            nn.Linear(patch_dim, embed_dim//2),
-            nn.LayerNorm(embed_dim //2),
+            nn.Linear(patch_dim, embed_dim // 2),
+            nn.LayerNorm(embed_dim // 2),
         )
 
         self.to_freq_patch = nn.Sequential(
-            Rearrange("b c (h p1) (w p2) -> (b h w) c p1 p2", p1 = freq_patch_height, p2 = freq_patch_width),
+            Rearrange(
+                "b c (h p1) (w p2) -> (b h w) c p1 p2",
+                p1=freq_patch_height,
+                p2=freq_patch_width,
+            ),
         )
 
         self.to_freq_embedding = nn.Sequential(
-            Rearrange("(b d) c p1 p2 ri -> b d (p1 p2 ri c)", p1 = freq_patch_height, p2 = freq_patch_width, d=patch_dims),
+            Rearrange(
+                "(b d) c p1 p2 ri -> b d (p1 p2 ri c)",
+                p1=freq_patch_height,
+                p2=freq_patch_width,
+                d=patch_dims,
+            ),
             nn.LayerNorm(freq_patch_dim),
-            nn.Linear(freq_patch_dim, embed_dim//2),
-            nn.LayerNorm(embed_dim // 2)
+            nn.Linear(freq_patch_dim, embed_dim // 2),
+            nn.LayerNorm(embed_dim // 2),
         )
 
         self.to_out = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            Rearrange("b (h w) d -> b d h w", h=h, w=w)
+            nn.Linear(embed_dim, embed_dim), Rearrange("b (h w) d -> b d h w", h=h, w=w)
         )
 
-    def forward(self, x): 
+    def forward(self, x):
         patch_emb = self.to_patch_embedding(x)
         patch_for_freq = self.to_freq_patch(x)
         freqs = torch.fft.fft2(patch_for_freq)
         freqs = torch.view_as_real(freqs)
         freqs_emb = self.to_freq_embedding(freqs)
 
-        merged_embs, _ = pack([freqs_emb, patch_emb], 'b n *')
-        
+        merged_embs, _ = pack([freqs_emb, patch_emb], "b n *")
+
         out = self.to_out(merged_embs)
-        return out 
+        return out
 
 
-class VisionTransformer(nn.Module):
+class ConvPatchEmbedWithNoOverlappingAcrossPatches(BasePatchEmbed):
+    def __init__(
+        self,
+        img_size=224,
+        patch_size=16,
+        in_chans=3,
+        embed_dim=768,
+        num_conv_layers=3,
+        kernel_size=3,
+    ):
+        super().__init__(img_size, patch_size, in_chans)
+
+        num_patches = (img_size // patch_size) * (img_size // patch_size)
+
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = num_patches
+
+        nph = npw = img_size // patch_size
+        self.split_into_patchs = Rearrange(
+            "b c (nph ph) (npw pw) -> (b nph npw) c ph pw", nph=npw, npw=npw
+        )
+        self.conv_layers = torch.nn.ModuleList()
+        in_chans = in_chans
+        out_chans = 16
+        for _ in range(num_conv_layers):
+            self.conv_layers.append(
+                nn.Conv2d(
+                    in_channels=in_chans,
+                    out_channels=out_chans,
+                    kernel_size=kernel_size,
+                    padding="same",
+                )
+            )
+            in_chans = out_chans
+            out_chans *= 2
+
+        self.global_pool = nn.AdaptiveAvgPool2d(output_size=(1, 1))
+        self.proj_to_embedding_dim = nn.Conv2d(out_chans//2, embed_dim, 1)
+        self.to_patch_token_grid = Rearrange(
+            "(b nph npw) c ph pw -> b c (nph ph) (npw pw)", nph=nph, npw=npw, pw=1, ph=1
+        )
+
+    def forward(self, x: torch.Tensor): 
+        x = self.split_into_patchs(x)
+
+        for layer in self.conv_layers: 
+            x = layer(x)
+            x = nn.MaxPool2d(2, 2)(x)
+            x = x.relu()
+
+        x = self.global_pool(x)
+        x = self.proj_to_embedding_dim(x)
+        x = self.to_patch_token_grid(x)
+
+        return x
+
+
+patch_embed_layers_classes = {
+    "patch_embed": PatchEmbed,
+    "fft_patch_embed": FFTPatchEmbed,
+    "fft_patch_embed_v2": FFTPatchEmbedV2,
+    "conv_patch_embed": partial(ConvPatchEmbedWithNoOverlappingAcrossPatches, num_conv_layers=3, kernel_size=3)
+}
+
+
+class VisionTransformer(BackboneNetwork):
     """Vision Transformer"""
 
     def __init__(
@@ -324,26 +431,44 @@ class VisionTransformer(nn.Module):
         attn_drop_rate=0.0,
         drop_path_rate=0.0,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        return_all_tokens=False,
         init_values=0,
         use_mean_pooling=False,
         masked_im_modeling=False,
-        patch_embed_cls=PatchEmbed,
+        patch_embed_factory: Callable | str = "patch_embed",
+        patch_embed_kw: dict = {},
+        n_cls_tokens=1,
+        use_sincos_pos_embed=False,
+        freeze_pos_embed=False,
     ):
         super().__init__()
-        self.num_features = self.embed_dim = embed_dim
-        self.return_all_tokens = return_all_tokens
 
-        self.patch_embed = patch_embed_cls(
+        if not isinstance(img_size, Sequence): 
+            img_size = [img_size]
+
+        self.num_features = self.embed_dim = embed_dim
+        self.n_cls_tokens = n_cls_tokens
+
+        if isinstance(patch_embed_factory, str):
+            patch_embed_factory = patch_embed_layers_classes[patch_embed_factory]
+
+        self.patch_embed = patch_embed_factory(
             img_size=img_size[0],
             patch_size=patch_size,
             in_chans=in_chans,
             embed_dim=embed_dim,
+            **patch_embed_kw,
         )
+
         num_patches = self.patch_embed.num_patches
 
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        self.cls_token = nn.Parameter(torch.zeros(1, n_cls_tokens, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, n_cls_tokens + num_patches, embed_dim))
+        if use_sincos_pos_embed: 
+            _sincos_pos_embed = posemb_sincos_2d(int(num_patches ** .5), int(num_patches ** .5), embed_dim).unsqueeze(0)
+            self.pos_embed[:, n_cls_tokens:, :] = _sincos_pos_embed
+        if freeze_pos_embed: 
+            self.pos_embed.requires_grad = False        
+
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         dpr = [
@@ -382,6 +507,8 @@ class VisionTransformer(nn.Module):
         self.masked_im_modeling = masked_im_modeling
         if masked_im_modeling:
             self.masked_embed = nn.Parameter(torch.zeros(1, embed_dim))
+        else: 
+            self.masked_embed = None
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -397,8 +524,8 @@ class VisionTransformer(nn.Module):
         N = self.pos_embed.shape[1] - 1
         if npatch == N and w == h:
             return self.pos_embed
-        class_pos_embed = self.pos_embed[:, 0]
-        patch_pos_embed = self.pos_embed[:, 1:]
+        class_pos_embed = self.pos_embed[:, :self.n_cls_tokens]
+        patch_pos_embed = self.pos_embed[:, self.n_cls_tokens:]
         dim = x.shape[-1]
         w0 = w // self.patch_embed.patch_size
         h0 = h // self.patch_embed.patch_size
@@ -417,7 +544,7 @@ class VisionTransformer(nn.Module):
             and int(h0) == patch_pos_embed.shape[-1]
         )
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
-        return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
+        return torch.cat((class_pos_embed, patch_pos_embed), dim=1)
 
     def prepare_tokens(self, x, mask=None):
         B, nc, w, h = x.shape
@@ -426,7 +553,11 @@ class VisionTransformer(nn.Module):
 
         # mask image modeling
         if mask is not None:
-            x = self.mask_model(x, mask)
+            if self.masked_im_modeling:
+                x.permute(0, 2, 3, 1)[mask, :] = self.masked_embed.to(x.dtype)
+            else: 
+                warn(f'Received mask but model is not configured for masked image modeling!')
+
         x = x.flatten(2).transpose(1, 2)
 
         # add the [CLS] token to the embed patch tokens
@@ -438,24 +569,19 @@ class VisionTransformer(nn.Module):
 
         return self.pos_drop(x)
 
-    def forward(self, x, return_all_tokens=None, mask=None):
+    def forward(self, x, return_all_tokens=False, mask=None):
         # mim
-        if self.masked_im_modeling:
-            assert mask is not None
-            x = self.prepare_tokens(x, mask=mask)
-        else:
-            x = self.prepare_tokens(x)
+        x = self.prepare_tokens(x, mask=mask)
 
+        layer_outputs = []
         for blk in self.blocks:
             x = blk(x)
-
+            layer_outputs.append(x)
+            
         x = self.norm(x)
         if self.fc_norm is not None:
             x[:, 0] = self.fc_norm(x[:, 1:, :].mean(1))
 
-        return_all_tokens = (
-            self.return_all_tokens if return_all_tokens is None else return_all_tokens
-        )
         if return_all_tokens:
             return x
         return x[:, 0]
@@ -482,13 +608,81 @@ class VisionTransformer(nn.Module):
     def get_num_layers(self):
         return len(self.blocks)
 
-    def mask_model(self, x, mask):
-        x.permute(0, 2, 3, 1)[mask, :] = self.masked_embed.to(x.dtype)
-        return x
+    def get_class_token(self, x) -> torch.Tensor:
+        tokens = self(x, return_all_tokens=False)
+        return tokens 
+
+    def get_feature_map(self, x) -> torch.Tensor:
+        tokens = self(x, return_all_tokens=True)
+        patch_tokens = tokens[:, self.n_cls_tokens:, :]
+        return self._tokens_to_feature_map(patch_tokens)
 
 
+def vit_tiny(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size,
+        embed_dim=192,
+        depth=12,
+        num_heads=3,
+        mlp_ratio=4,
+        qkv_bias=True,
+        **kwargs
+    )
+    return model
 
-if __name__ == '__main__': 
-    image = torch.randn(1, 3, 512, 512)
-    model = vit_small_fft(patch_size=32, img_size=[512])
-    model(image)
+
+def vit_small(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size,
+        embed_dim=384,
+        depth=12,
+        num_heads=6,
+        mlp_ratio=4,
+        qkv_bias=True,
+        **kwargs
+    )
+    return model
+
+
+def vit_base(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4,
+        qkv_bias=True,
+        **kwargs
+    )
+    return model
+
+
+def vit_large(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size,
+        embed_dim=1024,
+        depth=24,
+        num_heads=16,
+        mlp_ratio=4,
+        qkv_bias=True,
+        **kwargs
+    )
+    return model
+
+
+def vit_small_fft_v2(patch_size=16, **kwargs):
+    return vit_small(patch_size=patch_size, patch_embed_cls=FFTPatchEmbedV2, **kwargs)
+
+
+def vit_small_fft_v1(patch_size=16, **kwargs): 
+    return vit_small(patch_size=patch_size, patch_embed_cls=FFTPatchEmbed, **kwargs)  
+
+
+if __name__ == "__main__":
+    image = torch.randn(1, 3, 224, 224)
+    patch_embed = ConvPatchEmbedWithNoOverlappingAcrossPatches(
+        224, 16, 3, 
+    )
+    patch_embed_2 = PatchEmbed(224, 16, 3)
+
+    print(VisionTransformer(patch_embed_factory="conv_patch_embed").forward(image, return_all_tokens=True).shape)

@@ -1,0 +1,85 @@
+output_dir: checkpoint/pwilson/12736873
+nct_patches_data_path: /ssd005/projects/exactvu_pca/nct2013_bmode_patches
+wandb: {}
+load_from: null
+load_model_from: null
+saveckp_freq: 40
+seed: 0
+batch_size_per_gpu: 16
+num_workers: 4
+epochs: 800
+use_fp16: true
+freeze_last_layer: 20
+data:
+  pred_ratio: 0.3
+  pred_ratio_var: 0
+  pred_shape: block
+  pred_start_epoch: 0
+  path: /ssd005/projects/exactvu_pca/unlabelled_microus_png
+model:
+  patch_size: 16
+  n_prototypes: 8192
+  norm_last_layer: true
+  masked_im_modeling: true
+  use_masked_im_modeling: false
+loss:
+  warmup_teacher_temp: 0.04
+  teacher_temp: 0.04
+  warmup_teacher_patch_temp: 0.04
+  teacher_patch_temp: 0.07
+  warmup_teacher_temp_epochs: 30
+  lambda1: 1
+  lambda2: 1
+  pred_start_epoch: 0
+  vit_loss_weight: 1
+  cnn_loss_weight: 1
+  cross_loss_weight: 1
+optimizer:
+  clip_grad: 3.0
+  type: adamw
+  vit:
+    base_lr: 0.0001
+    frozen_epochs: 0
+    warmup_epochs: 10
+    weight_decay: 0.01
+    weight_decay_end: 0.1
+    min_lr: 1.0e-06
+  cnn:
+    base_lr: 0.0005
+    frozen_epochs: 0
+    warmup_epochs: 10
+    weight_decay: 0.01
+    weight_decay_end: 0.1
+    min_lr: 1.0e-06
+  momentum_teacher: 0.996
+transform:
+  global_crops_scale:
+  - 0.4
+  - 1
+  local_crops_scale:
+  - 0.05
+  - 0.4
+  global_crops_number: 2
+  local_crops_number: 4
+  global_crops_size: 224
+  local_crops_size: 96
+  jitter_prob: 0.0
+  mean:
+  - 0.485
+  - 0.456
+  - 0.406
+  std:
+  - 0.229
+  - 0.224
+  - 0.225
+  blur_prob_1: 0.0
+  blur_prob_2: 0.0
+  solarization_prob: 0
+  initial_crop_size: 768
+  initial_resize_size: null
+evaluation:
+  do_nct_probing: true
+  do_clstoken_nct_probing: false
+  do_register_probing: false
+  probing_freq: 20
+debug: true

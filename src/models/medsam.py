@@ -2,38 +2,41 @@ from torch import nn
 import torch 
 from segment_anything import sam_model_registry
 from segment_anything.modeling.image_encoder import ImageEncoderViT
+from segment_anything.modeling import Sam
 import os
 import math
-
-
-VECTOR_MEDSAM_CHECKPOINT = '/fs01/projects/exactvu_pca/checkpoint_store/medsam_vit_b_cpu.pth'
 
 
 def build_medsam():
     """
     Builds the MedSAM model by building the SAM model and loading the medsam checkpoint.
     """
-    checkpoint = VECTOR_MEDSAM_CHECKPOINT
+    MEDSAM_CHECKPOINT = os.environ.get('MEDSAM_CHECKPOINT')
+    if MEDSAM_CHECKPOINT is None:
+        raise ValueError("MEDSAM_CHECKPOINT environment variable must be set to use medsam.")
+    checkpoint = MEDSAM_CHECKPOINT
     model = sam_model_registry["vit_b"](checkpoint=checkpoint)
     return model
 
 
-
 class MedSAMIBot(nn.Module):
-    def __init__(self,):
+    def __init__(self, freeze_pos_embed=False):
         # keep defaults for now
-
         super().__init__()
 
         medsam_model = build_medsam()
         image_encoder = medsam_model.image_encoder
-        del image_encoder.neck # parameters of neck are unused, this causes DDP errors
+        del image_encoder.neck # parameters of neck are unused, delete it to avoid DDP "unused parameter" errors
 
         self.image_encoder_wrapped = ImageEncoderViTWithClassTokenAndMasking(
             medsam_model.image_encoder
         )
 
-    def forward(self, image, mask=None):
+        if freeze_pos_embed: 
+            for p in self.image_encoder_wrapped.image_encoder.patch_embed.parameters():
+                p.requires_grad = False
+
+    def forward(self, image, mask=None, return_all_tokens=True):
         outputs = self.image_encoder_wrapped(image, mask)
         return outputs
 
