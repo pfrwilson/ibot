@@ -1,4 +1,7 @@
 # model
+
+output_dir: /checkpoint/${oc.env:USER}/${oc.env:SLURM_JOB_ID}
+
 arch: medsam
 patch_size: 16
 window_size: 7

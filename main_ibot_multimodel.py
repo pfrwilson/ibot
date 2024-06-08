@@ -36,7 +36,10 @@ from src.probing_nct import NCTProbing
 import dotenv
 from src.transform import DataAugmentation
 import hydra
-from src.ssl_evaluation import build_linear_probe_for_nct_patches, build_kfold_linear_probe_for_nct_patches
+from src.ssl_evaluation import (
+    build_linear_probe_for_nct_patches,
+    build_kfold_linear_probe_for_nct_patches,
+)
 from timm.models.resnet import resnet18
 from src.models.wrappers import ResnetWrapper
 from src.models.head import DINOHead, iBOTHead
@@ -61,7 +64,11 @@ class MultiCropWrapper(nn.Module):
     concatenated features.
     """
 
-    def __init__(self, backbone, head=None, ):
+    def __init__(
+        self,
+        backbone,
+        head=None,
+    ):
         super(MultiCropWrapper, self).__init__()
         # disable layers dedicated to ImageNet labels classification
         backbone.fc, backbone.head = nn.Identity(), nn.Identity()
@@ -138,7 +145,7 @@ def train_ibot(conf):
     )
     logging.info(f"Data augmentation: {transform}")
 
-    pred_size = conf.model.patch_size 
+    pred_size = conf.model.patch_size
     dataset = ImageFolderMask(
         conf.data.path,
         transform=transform,
@@ -158,29 +165,41 @@ def train_ibot(conf):
         pin_memory=True,
         drop_last=True,
     )
-    if conf.debug: 
-        _batches = [] 
-        for i, batch in enumerate(data_loader): 
+    if conf.debug:
+        _batches = []
+        for i, batch in enumerate(data_loader):
             _batches.append(batch)
-            if i >= 10: break 
+            if i >= 10:
+                break
 
     logging.info(f"Data loaded: there are {len(dataset)} images.")
 
     vit_student, vit_teacher, cnn_student, cnn_teacher = build_models(conf)
-    vit_student = nn.parallel.DistributedDataParallel(
-        vit_student.cuda(), device_ids=[dist.get_rank()]
+    vit_student, vit_teacher, vit_teacher_without_ddp = setup_for_ddp(
+        vit_student, vit_teacher
     )
-    vit_teacher = vit_teacher.cuda()
-    # vit_teacher = nn.parallel.DistributedDataParallel(vit_teacher.cuda(), device_ids=[dist.get_rank()])
-    cnn_student = nn.parallel.DistributedDataParallel(
-        cnn_student.cuda(), device_ids=[dist.get_rank()]
+    cnn_student, cnn_teacher, cnn_teacher_without_ddp = setup_for_ddp(
+        cnn_student, cnn_teacher
     )
-    cnn_teacher = cnn_teacher.cuda()
-    # cnn_teacher = nn.parallel.DistributedDataParallel(cnn_teacher.cuda(), device_ids=[dist.get_rank()])
 
-    student = torch.nn.ModuleDict({"vit": vit_student, "cnn": cnn_student})
-    teacher = torch.nn.ModuleDict({"vit": vit_teacher, "cnn": cnn_teacher})
-
+    teacher_without_ddp = nn.ModuleDict(
+        {
+            "vit": vit_teacher_without_ddp,
+            "cnn": cnn_teacher_without_ddp,
+        }
+    )
+    student = nn.ModuleDict(
+        {
+            "vit": vit_student,
+            "cnn": cnn_student,
+        }
+    )
+    teacher = nn.ModuleDict(
+        {
+            "vit": vit_teacher,
+            "cnn": cnn_teacher,
+        }
+    )
     logging.info(
         f"Student and Teacher are built: {vit_student.__class__}, {cnn_student.__class__}"
     )
@@ -284,14 +303,12 @@ def train_ibot(conf):
             logging.info(f"Probing results: {probing_results}")
             wandb.log({"epoch": epoch - 1, **probing_results})
 
-
         # ============ training one epoch of iBOT ... ============
         logging.info(f"EPOCH {epoch}")
-        train_stats = train_one_epoch(
-            vit_student,
-            vit_teacher,
-            cnn_student,
-            cnn_teacher,
+        train_one_epoch(
+            student,
+            teacher,
+            teacher_without_ddp,
             ibot_loss,
             cnn_dino_loss,
             cross_dino_loss,
@@ -322,12 +339,11 @@ def train_ibot(conf):
                 save_dict, os.path.join(conf.output_dir, f"checkpoint{epoch:04}.pth")
             )
 
-        
+
 def train_one_epoch(
-    vit_student: nn.parallel.DistributedDataParallel,
-    vit_teacher: nn.Module,
-    cnn_student: nn.parallel.DistributedDataParallel,
-    cnn_teacher: nn.Module,
+    student,
+    teacher,
+    teacher_without_ddp,
     vit_ibot_loss: iBOTLoss,
     cnn_dino_loss: DINOLoss,
     cross_dino_loss: DINOLoss,
@@ -344,17 +360,14 @@ def train_one_epoch(
     header = "Epoch: [{}/{}]".format(epoch, conf.epochs)
 
     # common params
-    params_cnn_student, params_cnn_teacher = get_common_parameters(
-        cnn_student.module, cnn_teacher
-    )
-    params_vit_student, params_vit_teacher = get_common_parameters(
-        vit_student.module, vit_teacher
+    params_student, params_teacher = get_common_parameters(
+        nn.ModuleDict({'vit': student['vit'].module, 'cnn': student['cnn'].module}), teacher_without_ddp
     )
 
     for it, (images, labels, masks) in enumerate(
         metric_logger.log_every(data_loader, 10, header)
     ):
-        if conf.get('debug') and (it > 10): 
+        if conf.get("debug") and (it > 10):
             break
 
         # update weight decay and learning rate according to their schedule
@@ -377,14 +390,16 @@ def train_one_epoch(
             # Get VISION TRANSFORMER views
             # get global views
 
-            teacher_output = vit_teacher(
-                images[: conf.transform.global_crops_number], return_all_tokens=True
-            )
+            with torch.no_grad():
+                teacher_output = teacher["vit"](
+                    images[: conf.transform.global_crops_number], return_all_tokens=True
+                )
+
             teacher_output_cls = teacher_output[:, 0, :]
             # teacher_output_register = teacher_output[:, 1, :]
             teacher_output_patch = teacher_output[:, 2:, :]
 
-            student_output = vit_student(
+            student_output = student["vit"](
                 images[: conf.transform.global_crops_number],
                 mask=masks[: conf.transform.global_crops_number],
                 return_all_tokens=True,
@@ -395,7 +410,7 @@ def train_one_epoch(
 
             # get local views
             if len(images) > conf.transform.global_crops_number:
-                student_local_view_output = vit_student(
+                student_local_view_output = student["vit"](
                     images[conf.transform.global_crops_number :], return_all_tokens=True
                 )
                 student_local_cls = student_local_view_output[:, 0, :]
@@ -413,10 +428,12 @@ def train_one_epoch(
             )["loss"]
 
             # get CNN views
-            cnn_teacher_output = cnn_teacher(
-                images[: conf.transform.global_crops_number], return_all_tokens=False
-            )
-            cnn_student_output = cnn_student(images, return_all_tokens=False)
+            with torch.no_grad():
+                cnn_teacher_output = teacher["cnn"](
+                    images[: conf.transform.global_crops_number],
+                    return_all_tokens=False,
+                )
+            cnn_student_output = student["cnn"](images, return_all_tokens=False)
 
             loss_cnn = cnn_dino_loss(cnn_student_output, cnn_teacher_output, epoch)
 
@@ -440,8 +457,8 @@ def train_one_epoch(
                 wandb.log(
                     {
                         "loss": loss.item(),
-                        "vit_loss": loss_vit.item(), 
-                        "cnn_loss": loss_cnn.item(), 
+                        "vit_loss": loss_vit.item(),
+                        "cnn_loss": loss_cnn.item(),
                         "cross_loss": loss_cross.item(),
                         **lrs_and_wds_for_logging,
                     }
@@ -452,9 +469,6 @@ def train_one_epoch(
             logging.info("Warning: NaN value encountered in loss")
             continue
 
-        # put teacher and student together for convenience
-        student = nn.ModuleList([vit_student, cnn_student])
-        
         # student update
         optimizer.zero_grad()
         param_norms = None
@@ -475,12 +489,10 @@ def train_one_epoch(
             fp16_scaler.step(optimizer)
             fp16_scaler.update()
 
-       # EMA update for the teacher
+        # EMA update for the teacher
         with torch.no_grad():
             m = momentum_schedule[it]  # momentum parameter
-            for param_q, param_k in zip(params_cnn_student, params_cnn_teacher):
-                param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
-            for param_q, param_k in zip(params_vit_student, params_vit_teacher):
+            for param_q, param_k in zip(params_student, params_teacher):
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
 
         # logging
@@ -497,17 +509,34 @@ def train_one_epoch(
 
 
 def build_models(conf: DictConfig):
-    student_backbone = vit_small(patch_size=16, img_size=224, n_cls_tokens=2, masked_im_modeling=conf.model.masked_im_modeling)
-    teacher_backbone = vit_small(patch_size=16, img_size=224, n_cls_tokens=2)
+    from src.models import get_model as get_backbone
+
+    # student_backbone = vit_small(patch_size=16, img_size=224, n_cls_tokens=2, masked_im_modeling=conf.model.masked_im_modeling)
+    # teacher_backbone = vit_small(patch_size=16, img_size=224, n_cls_tokens=2)
+    student_backbone = get_backbone(
+        conf.model.vit_backbone.arch,
+        n_cls_tokens=2,
+        masked_im_modeling=conf.model.masked_im_modeling,
+        **conf.model.vit_backbone.get("kwargs", {}),
+    )
+    teacher_backbone = get_backbone(
+        conf.model.vit_backbone.arch, n_cls_tokens=2, **conf.model.vit_backbone.get("kwargs", {})
+    )
     vit_embed_dim = student_backbone.embed_dim
 
-    student_cnn_backbone = resnet18()
-    teacher_cnn_backbone = resnet18()
-    cnn_embed_dim = student_cnn_backbone.fc.weight.shape[1]
-    student_cnn_backbone.fc = nn.Identity()
-    teacher_cnn_backbone.fc = nn.Identity()
-    student_cnn_backbone = ResnetWrapper(student_cnn_backbone)
-    teacher_cnn_backbone = ResnetWrapper(teacher_cnn_backbone)
+    # student_cnn_backbone = resnet18()
+    # teacher_cnn_backbone = resnet18()
+    student_cnn_backbone = get_backbone(
+        conf.model.cnn_backbone.arch, **conf.model.cnn_backbone.kwargs
+    )
+    teacher_cnn_backbone = get_backbone(
+        conf.model.cnn_backbone.arch, **conf.model.cnn_backbone.kwargs
+    )
+    cnn_embed_dim = student_cnn_backbone.embed_dim
+    # student_cnn_backbone.fc = nn.Identity()
+    # teacher_cnn_backbone.fc = nn.Identity()
+    # student_cnn_backbone = ResnetWrapper(student_cnn_backbone)
+    # teacher_cnn_backbone = ResnetWrapper(teacher_cnn_backbone)
 
     head_kw = dict(
         out_dim=conf.model.n_prototypes,
@@ -545,17 +574,6 @@ def build_models(conf: DictConfig):
             **head_kw,
         ),
     )
-
-    # teacher and student start with the same weights
-    teacher.load_state_dict(student.state_dict(), strict=False)
-    # there is no backpropagation through the teacher, so no need for gradients
-    for p in teacher.parameters():
-        p.requires_grad = False
-
-    cnn_teacher.load_state_dict(cnn_student.state_dict(), strict=False)
-    # there is no backpropagation through the teacher, so no need for gradients
-    for p in cnn_teacher.parameters():
-        p.requires_grad = False
 
     return student, teacher, cnn_student, cnn_teacher
 
@@ -647,7 +665,16 @@ def setup_optimization(student, num_iters_per_epoch, conf):
     return optimizer, lr_schedulers, wd_schedulers, momentum_schedule, fp16_scaler
 
 
-def get_named_parameter_groups(model):
+def get_named_parameter_groups(model, mode=None):
+    """Returns a dictionary of named_parameter iterators.
+
+    These will be used to create optimizer parameter groups.
+
+    Args:
+        model (nn.Module): model to get named parameters from
+        mode (str, optional): If provided, this will affect the parameter
+            selection and naming conventions. Defaults to None.
+    """
     return {
         "vit": model["vit"].named_parameters(),
         "cnn": model["cnn"].named_parameters(),
@@ -655,6 +682,7 @@ def get_named_parameter_groups(model):
 
 
 def get_common_parameters(model1, model2):
+
     # common params
     names_q, params_q, names_k, params_k = [], [], [], []
     for name_q, param_q in model1.named_parameters():
@@ -664,6 +692,7 @@ def get_common_parameters(model1, model2):
         names_k.append(name_k)
         params_k.append(param_k)
     names_common = list(set(names_q) & set(names_k))
+
     params_q = [
         param_q for name_q, param_q in zip(names_q, params_q) if name_q in names_common
     ]
@@ -672,6 +701,35 @@ def get_common_parameters(model1, model2):
     ]
     return params_q, params_k
 
+
+def setup_for_ddp(student, teacher):
+    # move networks to gpu
+    student, teacher = student.cuda(), teacher.cuda()
+
+    # synchronize batch norms (if any)
+    if utils.has_batchnorms(student):
+        student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
+        teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
+
+        # we need DDP wrapper to have synchro batch norms working...
+        teacher = nn.parallel.DistributedDataParallel(
+            teacher, device_ids=[dist.get_rank()], broadcast_buffers=False
+        )
+        teacher_without_ddp = teacher.module
+    else:
+        # teacher_without_ddp and teacher are the same thing
+        teacher_without_ddp = teacher
+    student = nn.parallel.DistributedDataParallel(
+        student, device_ids=[dist.get_rank()], broadcast_buffers=False
+    )
+
+    # teacher and student start with the same weights
+    teacher_without_ddp.load_state_dict(student.module.state_dict(), strict=False)
+    # there is no backpropagation through the teacher, so no need for gradients
+    for p in teacher.parameters():
+        p.requires_grad = False
+
+    return student, teacher, teacher_without_ddp
 
 
 class SSLEvaluator:
@@ -683,9 +741,9 @@ class SSLEvaluator:
             )
         else:
             self.nct_probe = None
-            
+
         build_linear_probe = lambda: build_kfold_linear_probe_for_nct_patches(
-            data_path=conf.nct_patches_data_path, 
+            data_path=conf.nct_patches_data_path,
             input_size=conf.transform.global_crops_size,
             batch_size=conf.batch_size_per_gpu,
             device=torch.device("cuda"),
@@ -732,11 +790,13 @@ class SSLEvaluator:
                     probing_results, val_metrics, "val", "probing"
                 )
 
-        _get_cls_token = lambda model, im: model.get_class_token(im)
+        def get_class_token(model, im):
+            tokens = model(im, return_all_tokens=True)
+            return tokens[:, 0, :]
 
         if self.nct_clstoken_probe is not None:
             outputs = self.nct_clstoken_probe.run_probing(
-                model, _get_cls_token, is_main_process=utils.is_main_process()  # type: ignore
+                model, get_class_token, is_main_process=utils.is_main_process()  # type: ignore
             )
             if outputs is not None:
                 train_metrics, val_metrics = outputs
@@ -771,7 +831,7 @@ class SSLEvaluator:
 
 
 class MomentumUpdater:
-    def __init__(self, student, teacher, momentum_schedule): 
+    def __init__(self, student, teacher, momentum_schedule):
 
         self.momentum_schedule = momentum_schedule
 
@@ -784,20 +844,27 @@ class MomentumUpdater:
             names_k.append(name_k)
             params_k.append(param_k)
         names_common = list(set(names_q) & set(names_k))
-        assert len(names_common) > 0, "No common parameters found between student and teacher - check model architectures."
-        logging.info(f"Found {len(names_common)} common parameters between student and teacher.")
+        assert (
+            len(names_common) > 0
+        ), "No common parameters found between student and teacher - check model architectures."
+        logging.info(
+            f"Found {len(names_common)} common parameters between student and teacher."
+        )
 
         params_q = [
-            param_q for name_q, param_q in zip(names_q, params_q) if name_q in names_common
+            param_q
+            for name_q, param_q in zip(names_q, params_q)
+            if name_q in names_common
         ]
         params_k = [
-            param_k for name_k, param_k in zip(names_k, params_k) if name_k in names_common
+            param_k
+            for name_k, param_k in zip(names_k, params_k)
+            if name_k in names_common
         ]
         self.params_q = params_q
         self.params_k = params_k
 
-
-    def update(self, it): 
+    def update(self, it):
         # EMA update for the teacher
         breakpoint()
 
@@ -807,8 +874,6 @@ class MomentumUpdater:
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
 
         breakpoint()
-
-
 
 
 def update_optimizer(iter, optimizer, lr_schedulers, wd_schedulers):
@@ -828,48 +893,87 @@ def update_optimizer(iter, optimizer, lr_schedulers, wd_schedulers):
     return lrs_and_wds_for_logging
 
 
-def extract_checkpoint(checkpoint_path): 
-    """Given the path to a checkpoint, load the checkpoint and extract the student and teacher models.
-    
-    Returns: 
-        vit_student: VisionTransformer student model
-        vit_teacher: VisionTransformer teacher model
-        cnn_student: CNN student model
-        cnn_teacher: CNN teacher model
-        (with checkpoints loaded.)
-    """
+def get_model_from_checkpoint(checkpoint_path, model="teacher"):
 
-    sd = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+    state_dict = torch.load(checkpoint_path, map_location=torch.device("cpu"))
+    conf = state_dict["args"]
 
-    from main_ibot_multimodel import build_models
-    vit_student, vit_teacher, cnn_student, cnn_teacher = build_models(sd['args'])
+    def extract_state_dict_with_prefix(state_dict, prefix):
+        return {
+            k.replace(prefix, ""): v
+            for k, v in state_dict.items()
+            if k.startswith(prefix)
+        }
 
-    student = torch.nn.ModuleDict({
-        'vit': vit_student,
-        'cnn': cnn_student
-    })
+    vit_student, vit_teacher, cnn_student, cnn_teacher = build_models(conf)
+    match model:
+        case "student" | "vit_student":
+            model = vit_student.backbone
+            msg = model.load_state_dict(
+                extract_state_dict_with_prefix(
+                    state_dict["student"], "vit.module.backbone."
+                )
+            )
+            print(msg)
+        case "teacher" | "vit_teacher":
+            model = vit_teacher.backbone
+            msg = model.load_state_dict(
+                extract_state_dict_with_prefix(state_dict["teacher"], "vit.backbone.")
+            )
+            print(msg)
+        case "cnn_student":
+            model = cnn_student.backbone
+            msg = model.load_state_dict(
+                extract_state_dict_with_prefix(
+                    state_dict["student"], "cnn.module.backbone."
+                )
+            )
+            print(msg)
+        case "cnn_teacher":
+            model = cnn_teacher.backbone
+            msg = model.load_state_dict(
+                extract_state_dict_with_prefix(state_dict["teacher"], "cnn.backbone.")
+            )
+            print(msg)
+        case _:
+            raise ValueError(f"Unknown model {model}")
 
-    teacher = torch.nn.ModuleDict({
-        'vit': vit_teacher,
-        'cnn': cnn_teacher
-    })
-
-    print(teacher.load_state_dict(sd['teacher']))
-    print(student.load_state_dict({k.replace('.module', ''): v for k, v in sd['student'].items()}))
-
-    return vit_student, vit_teacher, cnn_student, cnn_teacher
+    return model
 
 
-def main():
+def get_conf(args=None):
+    parser = argparse.ArgumentParser(
+        "IBOT MultiModel training",
+        add_help=False,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--config",
+        "-c",
+        nargs="*",
+        default=["conf_new/main_ibot_multimodel.yaml"],
+        help="Path to one or more yaml config files.",
+    )
+    parser.add_argument(
+        "--overrides",
+        "-o",
+        nargs="*",
+        default=[],
+        help="Overrides for the configuration. Should be a dotlist (eg. key.subkey=value).",
+    )
+    parser.add_argument(
+        "--wandb_path", type=str, default=None, help="Path to wandb run to resume."
+    )
+    parser.add_argument(
+        "--resume_wandb",
+        action="store_true",
+        help="If specified, tries to resume the wandb run.",
+    )
+    parser.add_argument(
+        "--help", "-h", action="store_true", help="Show this help message and exit."
+    )
 
-    parser = argparse.ArgumentParser("IBOT MultiModel training", add_help=False, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--config', '-c', nargs='*', default=[], help="Path to one or more yaml config files.")
-    parser.add_argument('--overrides', '-o', nargs='*', default=[], help="Overrides for the configuration. Should be a dotlist (eg. key.subkey=value).")
-    parser.add_argument('--wandb_path', type=str, default=None, help="Path to wandb run to resume.")
-    parser.add_argument('--resume_wandb', action='store_true', help="If specified, tries to resume the wandb run.")
-    parser.add_argument('--help', '-h', action='store_true', help="Show this help message and exit.")
-
-    args = parser.parse_args()
+    args = parser.parse_args(args)
 
     conf = OmegaConf.create({})
     for conf_path in args.config:
@@ -893,8 +997,8 @@ def main():
         print(DELIMITER)
         parser.print_help()
         print(DELIMITER)
-        print("Configuration (override e.g. foo.bar=baz)\n", DELIMITER)
-        rich.print(OmegaConf.to_yaml(conf))
+        print("Configuration\n", DELIMITER)
+        rich.print(OmegaConf.to_yaml(conf, resolve=False))
         print(DELIMITER)
         sys.exit(0)
     else:
@@ -902,6 +1006,11 @@ def main():
         rich.print(conf)
         print(DELIMITER)
 
+    return conf
+
+
+def main():
+    conf = get_conf()
     train_ibot(conf)
 
     # train_ibot(conf)

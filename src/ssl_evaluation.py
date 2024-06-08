@@ -39,6 +39,7 @@ from . import utils
 from .models.wrappers import MultiCropWrapper
 from .models.base import BackboneNetwork
 from torch import distributed as dist
+from .optim import cosine_scheduler
 
 
 def compute_binary_classification_metrics(y_score, y_true, log_images=False):
@@ -292,6 +293,8 @@ class FineTuning:
 
     def __init__(
         self,
+        backbone: nn.Module,
+        criterion: nn.Module = nn.CrossEntropyLoss(),
         optimizer="adam",
         lr=1e-4,
         backbone_lr=1e-5,
@@ -302,7 +305,11 @@ class FineTuning:
         metrics_fn=lambda y_score, y_true: compute_binary_classification_metrics(
             y_score, y_true
         ),
+        monitored_metric="auc",
+        warmup_epochs=5, 
+        head_hidden_dims=[],
     ):
+        self.backbone = backbone
         self.optimizer = optimizer
         self.lr = lr
         self.backbone_lr = backbone_lr
@@ -311,25 +318,39 @@ class FineTuning:
         self.n_classes = n_classes
         self.log_fn = log_fn
         self.metrics_fn = metrics_fn
+        self.monitored_metric = monitored_metric
+        self._best_model_state = None
+        self.best_val_metric = -1000000
+        self.warmup_epochs = warmup_epochs
+        self.criterion = criterion
+        self.head_hidden_dims = head_hidden_dims
 
-    def run(self, backbone, train_loader, val_loader, test_loader=None):
-        linear_layer = nn.Linear(self.in_features, self.n_classes).to(
-            next(backbone.parameters()).device
+    @property
+    def best_model(self): 
+        model = nn.Sequential(self.backbone, self.head)
+        model.load_state_dict(self._best_model_state)
+        return model
+
+    def run(self, train_loader, val_loader, test_loader=None):
+        self.head = self._make_head().to(
+            next(self.backbone.parameters()).device
         )
-        opt, sched = self._setup_optimizer(backbone, linear_layer, len(train_loader))
-        model = nn.Sequential(backbone, linear_layer)
+        opt, sched = self._setup_optimizer(self.backbone, self.head, len(train_loader))
+        model = nn.Sequential(self.backbone, self.head)
         if dist.is_initialized():
             model = torch.nn.parallel.DistributedDataParallel(model)
 
-        criterion = torch.nn.CrossEntropyLoss()
-
         for epoch in range(self.epochs):
             train_metrics = self._epoch(
-                model, train_loader, criterion, opt, sched, f"Train epoch {epoch}"
+                model, train_loader, self.criterion, opt, sched, f"Train epoch {epoch}"
             )
             val_metrics = self._epoch(
-                model, val_loader, criterion, desc=f"Val epoch {epoch}"
+                model, val_loader, self.criterion, desc=f"Val epoch {epoch}"
             )
+            if val_metrics[self.monitored_metric] > self.best_val_metric:
+                self.best_val_metric = val_metrics[self.monitored_metric]
+                self._best_model_state = model.state_dict()
+
             metrics = {}
             metrics.update(
                 {f"{self.LOG_NAME}_val_{k}": v for k, v in val_metrics.items()}
@@ -340,11 +361,12 @@ class FineTuning:
             self.log_fn(metrics)
 
         if test_loader is not None:
-            test_metrics = self._epoch(
-                model, test_loader, criterion, desc=f"Test epoch {epoch}"
+            test_metrics, (class_scores, gt_labels) = self._epoch(
+                self.best_model, test_loader, self.criterion, desc=f"Test epoch {epoch}"
             )
-            metrics = {f"{self.LOG_NAME}_train_{k}": v for k, v in test_metrics.items()}
+            metrics = {f"{self.LOG_NAME}_test_{k}": v for k, v in test_metrics.items()}
             self.log_fn(metrics)
+            return (class_scores, gt_labels)
 
     def _epoch(
         self,
@@ -354,6 +376,7 @@ class FineTuning:
         opt=None,
         sched: torch.optim.lr_scheduler.LRScheduler | None = None,
         desc="Running",
+        return_outputs=False
     ):
         training = opt is not None
         device = next(model.parameters()).device
@@ -388,7 +411,10 @@ class FineTuning:
         gt_labels = torch.cat(gt_labels)
 
         metrics = self.metrics_fn(class_scores, gt_labels)
-        return metrics
+        if return_outputs:
+            return (metrics, (class_scores, gt_labels))
+        else: 
+            return metrics
 
     def _setup_optimizer(self, backbone, linear_layer, n_step_per_ep):
         params_groups = [
@@ -400,10 +426,26 @@ class FineTuning:
                 opt = torch.optim.Adam(params_groups)
             case _:
                 raise NotImplementedError(self.optimizer)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=self.epochs * n_step_per_ep
+
+        sch1 = cosine_scheduler(1, 0, self.epochs, n_step_per_ep, warmup_epochs=self.warmup_epochs)
+        sched = torch.optim.lr_scheduler.LambdaLR(
+            opt, lambda epoch: sch1[epoch] if epoch < len(sch1) else 0
         )
         return opt, sched
+
+    def _make_head(self): 
+        if len(self.head_hidden_dims) == 0: 
+            return nn.Linear(self.in_features, self.n_classes)
+        else: 
+            layers = []
+            in_dim = self.in_features
+            for out_dim in self.head_hidden_dims: 
+                layers.append(nn.Linear(in_dim, out_dim))
+                layers.append(nn.ReLU())
+                in_dim = out_dim
+            layers.append(nn.Linear(in_dim, self.n_classes))
+            return nn.Sequential(*layers)
+
 
 
 def get_nct_patches_loaders(

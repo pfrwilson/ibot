@@ -67,7 +67,8 @@ def train_ibot(conf):
     os.makedirs(conf.output_dir, exist_ok=True)
     OmegaConf.save(conf, os.path.join(conf.output_dir, "config.yaml"), resolve=True)
 
-    utils.init_distributed_mode(conf)
+    dist.init_process_group(backend='nccl')
+    torch.cuda.set_device(dist.get_rank())
     utils.fix_random_seeds(conf.seed)
 
     if utils.is_main_process():
@@ -118,18 +119,20 @@ def train_ibot(conf):
 
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
+
     # synchronize batch norms (if any)
     if utils.has_batchnorms(student):
+
         student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
         teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
         # we need DDP wrapper to have synchro batch norms working...
         teacher = (
             nn.parallel.DistributedDataParallel(
-                teacher, device_ids=[conf.gpu], broadcast_buffers=False
+                teacher, device_ids=[dist.get_rank()], broadcast_buffers=False
             )
             if "swin" in conf.arch
-            else nn.parallel.DistributedDataParallel(teacher, device_ids=[conf.gpu])
+            else nn.parallel.DistributedDataParallel(teacher, device_ids=[dist.get_rank()])
         )
         teacher_without_ddp = teacher.module
     else:
@@ -137,10 +140,10 @@ def train_ibot(conf):
         teacher_without_ddp = teacher
     student = (
         nn.parallel.DistributedDataParallel(
-            student, device_ids=[conf.gpu], broadcast_buffers=False
+            student, device_ids=[dist.get_rank()], broadcast_buffers=False
         )
         if "swin" in conf.arch
-        else nn.parallel.DistributedDataParallel(student, device_ids=[conf.gpu])
+        else nn.parallel.DistributedDataParallel(student, device_ids=[dist.get_rank()])
     )
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict(), strict=False)
@@ -586,14 +589,7 @@ def setup_optimization(student, num_iters_per_epoch, conf):
 
 
 def get_named_parameter_groups(model: MultiCropWrapper):
-    if isinstance(model.backbone, MedSAMIBot): 
-        print("MedSAMIBot")
-        raise NotImplementedError()
-
-    if isinstance(model, MedSAMIBot):
-        raise NotImplementedError()
-    else:
-        return {"main": model.named_parameters()}
+    return {"main": model.named_parameters()}
 
 
 class iBOTLoss(nn.Module):

@@ -1,7 +1,7 @@
-output_dir: checkpoint/pwilson/12736873
+output_dir: /checkpoint/${oc.env:USER}/${oc.env:SLURM_JOB_ID}
 nct_patches_data_path: /ssd005/projects/exactvu_pca/nct2013_bmode_patches
 wandb: {}
-load_from: null
+load_from: /checkpoint/pwilson/12737698
 load_model_from: null
 saveckp_freq: 40
 seed: 0
@@ -21,7 +21,6 @@ model:
   n_prototypes: 8192
   norm_last_layer: true
   masked_im_modeling: true
-  use_masked_im_modeling: false
 loss:
   warmup_teacher_temp: 0.04
   teacher_temp: 0.04
@@ -30,7 +29,7 @@ loss:
   warmup_teacher_temp_epochs: 30
   lambda1: 1
   lambda2: 1
-  pred_start_epoch: 0
+  pred_start_epoch: ${data.pred_start_epoch}
   vit_loss_weight: 1
   cnn_loss_weight: 1
   cross_loss_weight: 1
@@ -79,7 +78,7 @@ transform:
   initial_resize_size: null
 evaluation:
   do_nct_probing: true
-  do_clstoken_nct_probing: false
-  do_register_probing: false
+  do_clstoken_nct_probing: true
+  do_register_probing: true
   probing_freq: 20
-debug: true
+debug: false

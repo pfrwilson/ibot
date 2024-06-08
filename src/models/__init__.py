@@ -86,8 +86,8 @@ def vit_small_fft_v1(patch_size=16, **kwargs):
 
 
 @register_model 
-def medsam_ibot(**kwargs): 
-    from medsam import MedSAMIBot
+def medsam(**kwargs): 
+    from .medsam import MedSAMIBot
     model = MedSAMIBot(**kwargs)
     model.embed_dim = 768
     return model
@@ -95,12 +95,12 @@ def medsam_ibot(**kwargs):
 
 def _resnet(name, **kwargs):
     from timm.models import resnet
-    model = resnet.__dict__[name](pretrained=False, **kwargs)
+    model = resnet.__dict__[name](**kwargs)
     embed_dim = model.fc.weight.shape[1]
-    model.embed_dim = embed_dim
     model.fc = nn.Identity()
     from .wrappers import ResnetWrapper
     model = ResnetWrapper(model)
+    model.embed_dim = embed_dim
     return model
 
 

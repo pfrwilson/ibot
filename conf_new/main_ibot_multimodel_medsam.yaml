@@ -27,10 +27,9 @@ model:
   masked_im_modeling: true
 
   vit_backbone: 
-    arch: vit_small 
+    arch: medsam
     kwargs: 
-      patch_size: 16
-      img_size: 224
+      version: '2'
 
   cnn_backbone: 
     arch: resnet18

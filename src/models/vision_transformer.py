@@ -465,7 +465,7 @@ class VisionTransformer(BackboneNetwork):
         self.pos_embed = nn.Parameter(torch.zeros(1, n_cls_tokens + num_patches, embed_dim))
         if use_sincos_pos_embed: 
             _sincos_pos_embed = posemb_sincos_2d(int(num_patches ** .5), int(num_patches ** .5), embed_dim).unsqueeze(0)
-            self.pos_embed[:, n_cls_tokens:, :] = _sincos_pos_embed
+            self.pos_embed.data[:, n_cls_tokens:, :] = _sincos_pos_embed
         if freeze_pos_embed: 
             self.pos_embed.requires_grad = False        
 
