@@ -1,8 +1,13 @@
 import argparse
 import docstring_parser
-from argparse import ArgumentParser
 import inspect
 from typing import Iterable
+from argparse import ArgumentParser, Action, FileType, Namespace
+from collections.abc import Callable
+from typing import Any, Container, Iterable, Sequence
+from omegaconf import OmegaConf
+import argparse
+from dataclasses import is_dataclass
 
 
 def parse_type_or_null(str, type):
@@ -91,3 +96,98 @@ def quick_cli(func):
         return func(**kw)
 
     return wrapper
+
+
+def load_confs(paths):
+    c = OmegaConf.create({})
+    for value in paths:
+        c = OmegaConf.merge(c, OmegaConf.load(value))
+    return c
+
+
+def load_structured_confs(dataclasses): 
+    conf = None 
+    for dataclass in dataclasses: 
+        if conf is None: 
+            conf = OmegaConf.structured(dataclass)
+        else: 
+            conf = OmegaConf.merge(conf, OmegaConf.structured(conf))
+    return conf
+
+
+class LoadOmegaConf(Action):
+    def __init__(
+        self,
+        option_strings: Sequence[str],
+        dest: str,
+        nargs: int | str | None = "+",
+        default=[],
+        required: bool = False,
+        help: str | None = None,
+        metavar: str | tuple[str, ...] | None = None,
+    ) -> None:
+        if not isinstance(default, Sequence): 
+            default=[default]
+        if len(default) == 0 or isinstance(default[0], str):
+            default = load_confs(default)
+        elif is_dataclass(default[0]): 
+            default = load_structured_confs(default)
+
+        super().__init__(
+            option_strings,
+            dest,
+            nargs=nargs,
+            default=default,
+            required=required,
+            help=help,
+            metavar=metavar,
+        )
+
+    def __call__(
+        self,
+        parser: ArgumentParser,
+        namespace: Namespace,
+        values: str | Sequence[Any] | None,
+        option_string: str | None = None,
+    ) -> None:
+        from omegaconf import OmegaConf
+
+        c = load_confs(values)
+
+        setattr(namespace, self.dest, c)
+
+
+class OverrideYaml(Action):
+    def __init__(
+        self,
+        option_strings: Sequence[str],
+        dest: str,
+        nargs: int | str | None = "+",
+        default=[],
+        required: bool = False,
+        help: str | None = None,
+        metavar: str | tuple[str, ...] | None = "key=value",
+    ) -> None:
+        super().__init__(
+            option_strings,
+            dest,
+            nargs=nargs,
+            default=default,
+            required=required,
+            help=help,
+            metavar=metavar,
+        )
+
+    def __call__(
+        self,
+        parser: ArgumentParser,
+        namespace: Namespace,
+        values: str | Sequence[Any] | None,
+        option_string: str | None = None,
+    ) -> None:
+        assert hasattr(namespace, self.dest), f"Error in parsing arguments"
+        c = getattr(namespace, self.dest)
+        c = OmegaConf.merge(c, OmegaConf.from_dotlist(values))
+        setattr(namespace, self.dest, c)
+
+        parser._defaults[self.dest] = c

@@ -1,6 +1,10 @@
 # model
 
 output_dir: /checkpoint/${oc.env:USER}/${oc.env:SLURM_JOB_ID}
+data_path: /ssd005/projects/exactvu_pca/unlabelled_microus_png
+nct_patches_data_path: '/ssd005/projects/exactvu_pca/nct2013_bmode_patches'
+load_from: null
+load_model_from: null
 
 arch: medsam
 patch_size: 16
@@ -10,7 +14,7 @@ patch_out_dim: 8192
 shared_head: false
 shared_head_teacher: true
 norm_last_layer: true
-momentum_teacher: 0.996
+momentum_teacher: 0.9995
 norm_in_head: null
 act_in_head: gelu
 use_masked_im_modeling: true
@@ -31,7 +35,7 @@ teacher_patch_temp: 0.07
 warmup_teacher_temp_epochs: 30
 use_fp16: true
 clip_grad: 3.0
-batch_size_per_gpu: 16
+batch_size_per_gpu: 8
 epochs: 500
 freeze_last_layer: 1
 
@@ -46,10 +50,7 @@ optimizer:
     min_lr: 1.0e-06
 
 # paths
-load_from: null
-load_model_from: null
 drop_path: 0.1
-data_path: /ssd005/projects/exactvu_pca/unlabelled_microus_png
 
 saveckp_freq: 40
 seed: 0
@@ -59,10 +60,7 @@ num_workers: 10
 dist_url: env://
 
 # other options
-do_unsupervised_eval: false
-do_nct_probing: true
-do_clstoken_nct_probing: true
-probing_freq: 10
+
 wandb_run_id: null
 
 transform:
@@ -85,14 +83,20 @@ transform:
     - 0.229
     - 0.224
     - 0.225
-  blur_prob_1: 0.0
-  blur_prob_2: 0.0
-  solarization_prob: 0
+  blur_prob_1: 0.8
+  blur_prob_2: 0.1
+  solarization_prob: 0.2
   initial_crop_size: 768
   initial_resize_size: null
 
 wandb:
   name: long_run_conv_patch_emb
+
+evaluation: 
+  do_nct_probing: true
+  do_clstoken_nct_probing: true
+  do_register_probing: true
+  probing_freq: 20
 
 world_size: null 
 rank: null 

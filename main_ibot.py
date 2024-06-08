@@ -50,9 +50,11 @@ from src.transform import DataAugmentation
 import hydra
 from src.ssl_evaluation import build_linear_probe_for_nct_patches
 from dataclasses import asdict
-from simple_parsing import parse, subgroups, parse_known_args, field, ArgumentParser
+from argparse import ArgumentParser
 from src.launcher import LAUNCHERS, Launcher
 from src.models.wrappers import MultiCropWrapper
+from src.ssl_evaluation import build_kfold_linear_probe_for_nct_patches
+from src.argparse_utils import LoadOmegaConf, OverrideYaml
 
 
 dotenv.load_dotenv()
@@ -260,9 +262,9 @@ def train_ibot(conf):
             )
 
         # ======== run and log probing results ========
-        if (epoch + 1) % conf.probing_freq == 0:
+        if epoch % conf.evaluation.probing_freq == 0:
             probing_results = ssl_evaluator(
-                teacher_without_ddp,
+                teacher_without_ddp.backbone,
                 epoch,
                 "cuda",
                 is_main_process=utils.is_main_process(),
@@ -410,15 +412,15 @@ def train_one_epoch(
 
     return_dict = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
-    if conf.do_unsupervised_eval:
-        nmi, ari, fscore, adjacc = eval_pred(real_labels, pred_labels, calc_acc=False)
-        # gather the stats from all processes
-        metric_logger.synchronize_between_processes()
-        logging.info(
-            "NMI: {}, ARI: {}, F: {}, ACC: {}".format(nmi, ari, fscore, adjacc)
-        )
-        logging.info("Averaged stats:", metric_logger)
-        return_dict.update({"nmi": nmi, "ari": ari, "fscore": fscore, "adjacc": adjacc})
+    # if conf.do_unsupervised_eval:
+    #     nmi, ari, fscore, adjacc = eval_pred(real_labels, pred_labels, calc_acc=False)
+    #     # gather the stats from all processes
+    #     metric_logger.synchronize_between_processes()
+    #     logging.info(
+    #         "NMI: {}, ARI: {}, F: {}, ACC: {}".format(nmi, ari, fscore, adjacc)
+    #     )
+    #     logging.info("Averaged stats:", metric_logger)
+    #     return_dict.update({"nmi": nmi, "ari": ari, "fscore": fscore, "adjacc": adjacc})
 
     return return_dict
 
@@ -735,7 +737,7 @@ class iBOTLoss(nn.Module):
 
 class SSLEvaluator:
     def __init__(self, conf):
-        if conf.do_nct_probing:
+        if conf.evaluation.do_nct_probing:
             logging.info(f"Setting up NCT probing...")
             self.nct_probe = NCTProbing(
                 conf.batch_size_per_gpu, size=conf.transform.global_crops_size
@@ -743,19 +745,27 @@ class SSLEvaluator:
         else:
             self.nct_probe = None
 
-        if conf.get("do_clstoken_nct_probing", False):
+        build_linear_probe = lambda: build_kfold_linear_probe_for_nct_patches(
+            data_path=conf.nct_patches_data_path,
+            input_size=conf.transform.global_crops_size,
+            batch_size=conf.batch_size_per_gpu,
+            device=torch.device("cuda"),
+        )
+        if conf.evaluation.do_clstoken_nct_probing:
             logging.info(f"Setting up patch NCT probing...")
-            self.nct_clstoken_probe = build_linear_probe_for_nct_patches(
-                input_size=conf.transform.global_crops_size,
-                batch_size=conf.batch_size_per_gpu,
-                device="cuda",
-            )
+            self.nct_clstoken_probe = build_linear_probe()
         else:
             self.nct_clstoken_probe = None
 
+        if conf.evaluation.do_register_probing:
+            logging.info(f"Setting up probing for register token")
+            self.register_token_probe = build_linear_probe()
+        else:
+            self.register_token_probe = None
+
     def __call__(
         self,
-        model: src.models.wrappers.MultiCropWrapper,
+        model,
         epoch,
         device,
         is_main_process,
@@ -763,11 +773,15 @@ class SSLEvaluator:
         logging.info(f"Running NCT Probing")
         probing_results = {}
 
+        def extract_feature_map(model, x: torch.Tensor):
+            return model.get_feature_map(x)
+
         if self.nct_probe is not None:
             outputs = self.nct_probe.run_probing(
                 model,
                 epoch,
                 "cuda",
+                extract_feature_map,  # type: ignore
                 is_main_process=utils.is_main_process(),
             )
             if outputs is not None:
@@ -779,49 +793,95 @@ class SSLEvaluator:
                     probing_results, val_metrics, "val", "probing"
                 )
 
+        def get_class_token(model, im):
+            tokens = model(im, return_all_tokens=True)
+            return tokens[:, 0, :]
+
         if self.nct_clstoken_probe is not None:
             outputs = self.nct_clstoken_probe.run_probing(
-                model, is_main_process=utils.is_main_process()
+                model, get_class_token, is_main_process=utils.is_main_process()  # type: ignore
             )
             if outputs is not None:
                 train_metrics, val_metrics = outputs
                 self._add_metrics_to_dict(
-                    probing_results, train_metrics, "train", "clstoken_probing"
+                    probing_results, train_metrics, "train", "clstoken_probing_kfold"
                 )
                 self._add_metrics_to_dict(
-                    probing_results, val_metrics, "val", "clstoken_probing"
+                    probing_results, val_metrics, "val", "clstoken_probing_kfold"
+                )
+
+        def get_register_token(model, im):
+            tokens = model(im, return_all_tokens=True)
+            return tokens[:, 1, :]
+
+        if self.register_token_probe is not None:
+            outputs = self.register_token_probe.run_probing(
+                model, get_register_token, is_main_process=utils.is_main_process()  # type: ignore
+            )
+            if outputs is not None:
+                train_metrics, val_metrics = outputs
+                self._add_metrics_to_dict(
+                    probing_results, train_metrics, "train", "regtoken_probing_kfold"
+                )
+                self._add_metrics_to_dict(
+                    probing_results, val_metrics, "val", "regtoken_probing_kfold"
                 )
 
         return probing_results
 
-    def _add_metrics_to_dict(self, d, metrics, split, name):
-        d.update({f"{split}_{k}_{name}": v for k, v in metrics.items()})
+
+# @dataclass
+# class Args:
+#     """Main IBot Training"""
+#     config: list[str] = field(default_factory=lambda: [], alias="c")
+#     overrides: list[str] = field(default_factory=list, alias='-o')
+#     wandb_path: str | None = None
+#     resume_wandb: bool = False  # If specified, tries to resume the wandb run.
+#     help: bool = field(alias="h", default=False)
+#     # launcher: Launcher = subgroups(LAUNCHERS, default="basic")
 
 
-@dataclass
-class Args:
-    """Main IBot Training"""
-    config: list[str] = field(default_factory=lambda: [], alias="c")
-    overrides: list[str] = field(default_factory=list, alias='-o')
-    wandb_path: str | None = None
-    resume_wandb: bool = False  # If specified, tries to resume the wandb run.
-    help: bool = field(alias="h", default=False)
-    # launcher: Launcher = subgroups(LAUNCHERS, default="basic")
+def get_arg_parser(): 
+    parser = argparse.ArgumentParser(
+        "IBOT MultiModel training",
+        add_help=False,
+    )
+    parser.add_argument(
+        "--config",
+        "-c",
+        action=LoadOmegaConf,
+        default=["conf_new/main_ibot.yaml"],
+        help="Path to one or more yaml config files.",
+    )
+    parser.add_argument(
+        "--overrides",
+        "-o",
+        action=OverrideYaml,
+        dest="config",
+        help="Overrides for the configuration. Should be a dotlist (eg. key.subkey=value).",
+        default=[],
+    )
+    parser.add_argument(
+        "--wandb_path", type=str, default=None, help="Path to wandb run to resume."
+    )
+    parser.add_argument(
+        "--resume_wandb",
+        action="store_true",
+        help="If specified, tries to resume the wandb run.",
+    )
+    parser.add_argument(
+        "--print_cfg", action='store_true', help='Print config and exit.'
+    )
+    return parser
 
 
 def main():
     parser = ArgumentParser(
-        nested_mode=simple_parsing.NestedMode.WITHOUT_ROOT, add_help=False
+        parents=[get_arg_parser()]
     )
-    parser.add_arguments(Args, dest="args")
 
-    args_ = parser.parse_args()
-    args: Args = args_.args
-
-    conf = OmegaConf.create({})
-    for conf_path in args.config:
-        conf = OmegaConf.merge(conf, OmegaConf.load(conf_path))
-
+    args = parser.parse_args()
+    conf = args.config
     if args.wandb_path is not None:
         # resume from wandb
         api = wandb.Api()
@@ -833,22 +893,7 @@ def main():
         if args.resume_wandb:
             conf.load_from = conf.output_dir
             conf.wandb.id = run.id
-
-    conf = OmegaConf.merge(conf, OmegaConf.from_dotlist(args.overrides))
-
-    if args.help:
-        print(DELIMITER)
-        parser.print_help()
-        print(DELIMITER)
-        print("Configuration (override e.g. foo.bar=baz)\n", DELIMITER)
-        rich.print(OmegaConf.to_yaml(conf))
-        print(DELIMITER)
-        sys.exit(0)
-    else:
-        print(DELIMITER)
-        rich.print(conf)
-        print(DELIMITER)
-
+    
     train_ibot(conf)
 
     #train_ibot(conf)

@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 import SimpleITK as sitk
@@ -172,7 +173,36 @@ class NCT2013PatchesDataset(Dataset):
             return self.transform(image, metadata)
         return image, metadata
 
+
+class NCT2013ImagesAndCancerMasksDataset(Dataset): 
+    def __init__(self, root: str, core_ids: list[str] | Literal['all'] = 'all', transform: Callable | None = None): 
+        self.root = root
+        self.transform = transform
+
+        if core_ids == 'all': 
+            core_ids = os.listdir(root)
+
+        self.core_ids = core_ids
+
+    def __len__(self): 
+        return len(self.core_ids)
+    
+    def __getitem__(self, idx): 
+        core_id = self.core_ids[idx]
+        img_path = os.path.join(self.root, core_id, 'bmode.png')
+        mask_path = os.path.join(self.root, core_id, 'cancer_mask.png')
+        metadata_path = os.path.join(self.root, core_id, 'metadata.json')
+
+        img = Image.open(img_path)
+        mask = Image.open(mask_path)
+        metadata = json.load(open(metadata_path))
+
+        output = (img, mask, metadata) if self.transform is None else self.transform(img, mask, metadata)
+        return output
+
+
 if __name__ == "__main__":
-    dataset = NCT2013PatchesDataset(root='/ssd005/projects/exactvu_pca/nct2013_bmode_patches')
+    #dataset = NCT2013PatchesDataset(root='/ssd005/projects/exactvu_pca/nct2013_bmode_patches')
+    dataset = NCT2013ImagesAndCancerMasksDataset('/ssd005/projects/exactvu_pca/nct2013_bmode_png')
     breakpoint()
     pass

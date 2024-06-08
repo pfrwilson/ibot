@@ -3,7 +3,7 @@ echo SLURM_PROCID:$SLURM_PROCID
 echo $CUDA_VISIBLE_DEVICES
 
 CHECKPOINT_DIR=/checkpoint/$USER/$SLURM_JOB_ID
-EXPERIMENT_DIR=experiment/$SLURM_JOB_ID
+# EXPERIMENT_DIR=experiment/$SLURM_JOB_ID
 
 if [ $SLURM_LOCALID = 0 ]
 then
@@ -28,4 +28,4 @@ export TQDM_DISABLE='True'
 IMAGENET_DATA=/scratch/ssd004/datasets/imagenet256/train 
 MICROUS_DATA=/ssd005/projects/exactvu_pca/unlabelled_microus_png
 
-python main_ibot.py -c conf_new/main_ibot.yaml --overrides output_dir=$EXPERIMENT_DIR 
+python main_ibot.py -c conf_new/main_ibot.yaml 

@@ -1,57 +1,35 @@
 import argparse
-from dataclasses import asdict, dataclass
-from distutils.command import build
 from itertools import chain
 import os
 import sys
 import math
-import numpy as np
-import simple_parsing
-import src
-import src.models
-from src.models.medsam import MedSAMIBot
-import src.models.wrappers
 import src.utils as utils
-import src.models as models
 from src.models.medsam import MedSAMIBot
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-import torch.nn.functional as F
-import hydra
-
-from pathlib import Path
-from PIL import Image
-from torchvision import datasets, transforms
-from torchvision import models as torchvision_models
 import wandb
-from src.models.head import iBOTHead
 from loader import ImageFolderMask
-from evaluation.unsupervised.unsup_cls import eval_pred
-from timm.models import resnet
 import rich
 from omegaconf import DictConfig, OmegaConf
 import logging
 from src.probing_nct import NCTProbing
 import dotenv
 from src.transform import DataAugmentation
-import hydra
 from src.ssl_evaluation import (
     build_linear_probe_for_nct_patches,
     build_kfold_linear_probe_for_nct_patches,
 )
 from timm.models.resnet import resnet18
-from src.models.wrappers import ResnetWrapper
-from src.models.head import DINOHead, iBOTHead
-from src.models.vision_transformer import vit_small, VisionTransformer
+from src.models.head import DINOHead
 from src.loss import iBOTLoss, DINOLoss
 from torch import distributed as dist
 from src.models.base import BackboneNetwork
+from src.argparse_utils import LoadOmegaConf, OverrideYaml
+from rich_argparse import ArgumentDefaultsRichHelpFormatter
+
 
 dotenv.load_dotenv()
-
-
-DELIMITER = "=" * 100
 
 
 class MultiCropWrapper(nn.Module):
@@ -131,6 +109,7 @@ def train_ibot(conf):
             level=logging.INFO,
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         )
+        conf.wandb.id = str(conf.wandb.id)
         wandb.init(
             project="iBOT",
             config=OmegaConf.to_container(conf, resolve=True),  # type:ignore
@@ -941,7 +920,43 @@ def get_model_from_checkpoint(checkpoint_path, model="teacher"):
     return model
 
 
+def get_arg_parser(): 
+
+    parser = argparse.ArgumentParser(
+        "IBOT MultiModel training",
+        add_help=False,
+    )
+    parser.add_argument(
+        "--config",
+        "-c",
+        action=LoadOmegaConf,
+        default=["conf_new/main_ibot_multimodel.yaml"],
+        help="Path to one or more yaml config files.",
+    )
+    parser.add_argument(
+        "--overrides",
+        "-o",
+        action=OverrideYaml,
+        dest="config",
+        help="Overrides for the configuration. Should be a dotlist (eg. key.subkey=value).",
+        default=[],
+    )
+    parser.add_argument(
+        "--wandb_path", type=str, default=None, help="Path to wandb run to resume."
+    )
+    parser.add_argument(
+        "--resume_wandb",
+        action="store_true",
+        help="If specified, tries to resume the wandb run.",
+    )
+    parser.add_argument(
+        "--print_cfg", action='store_true', help='Print config and exit.'
+    )
+    return parser
+
+
 def get_conf(args=None):
+    DELIMITER = "=" * 100
     parser = argparse.ArgumentParser(
         "IBOT MultiModel training",
         add_help=False,
@@ -972,6 +987,7 @@ def get_conf(args=None):
     parser.add_argument(
         "--help", "-h", action="store_true", help="Show this help message and exit."
     )
+    
 
     args = parser.parse_args(args)
 
@@ -1010,7 +1026,29 @@ def get_conf(args=None):
 
 
 def main():
-    conf = get_conf()
+    # conf = get_conf()
+    parser = argparse.ArgumentParser(
+        parents=[get_arg_parser()], 
+        formatter_class=ArgumentDefaultsRichHelpFormatter
+    )
+    args = parser.parse_args()
+    conf = args.config
+    if args.wandb_path is not None:
+        # resume from wandb
+        api = wandb.Api()
+        run = api.run(args.wandb_path)
+        run_conf = OmegaConf.create(run.config)
+        print(f"{run.id} loaded from wandb.")
+        # copy config
+        conf = OmegaConf.merge(conf, run_conf)
+        if args.resume_wandb:
+            conf.load_from = conf.output_dir
+            conf.wandb.id = run.id
+
+    if args.print_cfg: 
+        rich.print(OmegaConf.to_yaml(conf))
+        sys.exit(0)
+
     train_ibot(conf)
 
     # train_ibot(conf)

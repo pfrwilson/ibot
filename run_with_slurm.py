@@ -1,11 +1,12 @@
 
-from argparse import ArgumentParser
+from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 import datetime
 import os
 import sys
 
 import rich
-from main_ibot_multimodel import get_conf
+# from main_ibot_multimodel import ArgumentDefaultsRichHelpFormatter, get_conf
+import importlib
 
 
 SLRM_TEMPLATE = """#!/bin/bash
@@ -44,9 +45,6 @@ export MASTER_ADDR=localhost
 export RANK=$SLURM_LOCALID
 export LOCAL_RANK=$SLURM_LOCALID
 export WORLD_SIZE=$SLURM_NTASKS
-
-WANDB_ID=$SLURM_JOB_ID
-export WANDB_RUN_ID=$WANDB_ID
 export WANDB_RESUME='ALLOW'
 export TQDM_DISABLE='True'
 
@@ -56,16 +54,20 @@ python {script} {args}
 
 def main(): 
     parser = ArgumentParser(description="Make slurm script to run the program", add_help=False)
+    parser.add_argument('program')
     parser.add_argument('--slrm_help', '-sh', action='help')
-    parser.add_argument('--gpus', type=int, default=8)
-    parser.add_argument('--job_name', default='ibot')
+    parser.add_argument('--slrm_gpus', type=int, default=8)
+    parser.add_argument('--slrm_job_name', default='ibot')
     parser.add_argument('--slrm_dir', default='.slurm')
 
-    
     args, extras = parser.parse_known_args()
     rich.print(vars(args))
 
-    conf = get_conf(extras)
+    program = args.program
+    module = importlib.import_module(program.replace('.py', ""))
+    get_parser = getattr(module, 'get_arg_parser')
+    prog_parser = ArgumentParser(parents=[get_parser()], formatter_class=ArgumentDefaultsHelpFormatter)
+    prog_parser.parse_args(extras)
 
     os.makedirs(args.slrm_dir, exist_ok=True)
     prefix = datetime.datetime.now().strftime('%Y-%m-%d_%H-%m-%S')
@@ -74,12 +76,12 @@ def main():
     bash_file = os.path.join(args.slrm_dir, f"{prefix}.sh")
 
     with open(bash_file, 'w') as f: 
-        f.write(SH_TEMPLATE.format(script='main_ibot_multimodel.py', args=" ".join(extras)))    
+        f.write(SH_TEMPLATE.format(script=program, args=" ".join(extras)))    
     with open(slurm_file, 'w') as f: 
         f.write(SLRM_TEMPLATE.format(
-            job_name=args.job_name, 
-            gpus=args.gpus, 
-            mem=16*args.gpus, 
+            job_name=args.slrm_job_name, 
+            gpus=args.slrm_gpus, 
+            mem=16*args.slrm_gpus, 
             bash_file=bash_file
         ))
     os.system(f'sbatch {slurm_file}')
