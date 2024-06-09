@@ -103,5 +103,7 @@ evaluation:
   do_register_probing: true
   probing_freq: 20
 
+monitored_metric: val_auc_probing
+
 debug: false
 slurm_job_id: ${oc.env:SLURM_JOB_ID}

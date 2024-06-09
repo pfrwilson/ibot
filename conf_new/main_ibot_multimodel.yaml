@@ -50,7 +50,7 @@ loss:
   vit_loss_weight: 1
   cnn_loss_weight: 1
   cross_loss_weight: 1
-
+  
 optimizer: 
   clip_grad: 3.0
   type: adamw
@@ -80,7 +80,7 @@ transform:
     - 0.05
     - 0.4
   global_crops_number: 2
-  local_crops_number: 4
+  local_crops_number: 0
   global_crops_size: 224
   local_crops_size: 96
   jitter_prob: 0.0
@@ -97,12 +97,19 @@ transform:
   solarization_prob: 0
   initial_crop_size: 768
   initial_resize_size: null
+  speckle_prob: 0.2
+  salt_and_pepper_prob: 0.1 
+  random_gamma_prob: 0.5
+  random_contrast_prob: 0.3
 
 evaluation: 
   do_nct_probing: true
   do_clstoken_nct_probing: true
   do_register_probing: true
   probing_freq: 20
+
+monitored_metric: val_auc_probing
+
 
 debug: false
 slurm_job_id: ${oc.env:SLURM_JOB_ID}

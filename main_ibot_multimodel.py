@@ -116,7 +116,7 @@ def train_ibot(conf):
             resume="allow",
             **conf.wandb,
         )
-    # torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = True
 
     # ============ preparing data ... ============
     transform = DataAugmentation(
@@ -223,7 +223,7 @@ def train_ibot(conf):
     ssl_evaluator = SSLEvaluator(conf)
 
     # ============ optionally resume training ... ============
-    to_restore = {"epoch": 0}
+    to_restore = {"epoch": 0, "best_score": 0.0}
     restore_variables = {}
     restore_variables["student"] = student
     restore_variables["teacher"] = teacher
@@ -261,6 +261,7 @@ def train_ibot(conf):
         )
 
     start_epoch = to_restore["epoch"]
+    best_score = to_restore["best_score"]
 
     logging.info("Starting iBOT training!")
     for epoch in range(start_epoch, conf.epochs):
@@ -281,6 +282,23 @@ def train_ibot(conf):
         if probing_results:
             logging.info(f"Probing results: {probing_results}")
             wandb.log({"epoch": epoch - 1, **probing_results})
+
+            if conf.get("monitored_metric") is not None: 
+                if probing_results[conf.monitored_metric] > best_score:
+                    logging.info(f"New best score: {probing_results[conf.monitored_metric]}")
+                    best_score = probing_results[conf.monitored_metric]
+                    save_dict = {
+                        "student": student.state_dict(),
+                        "teacher": teacher.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "epoch": epoch + 1,
+                        "best_score": best_score,
+                        "args": conf,
+                        "ibot_loss": ibot_loss.state_dict(),
+                    }
+                    if fp16_scaler is not None:
+                        save_dict["fp16_scaler"] = fp16_scaler.state_dict()
+                    utils.save_on_master(save_dict, os.path.join(conf.output_dir, "best.pth"))
 
         # ============ training one epoch of iBOT ... ============
         logging.info(f"EPOCH {epoch}")
@@ -307,6 +325,7 @@ def train_ibot(conf):
             "teacher": teacher.state_dict(),
             "optimizer": optimizer.state_dict(),
             "epoch": epoch + 1,
+            "best_score": best_score,
             "args": conf,
             "ibot_loss": ibot_loss.state_dict(),
         }
@@ -568,7 +587,7 @@ def setup_optimization(student, num_iters_per_epoch, conf):
     lr_schedulers = []
     wd_schedulers = []
 
-    for group_name, named_parameters in get_named_parameter_groups(student).items():
+    for group_name, named_parameters in get_named_parameter_groups(student, mode=conf.optimizer.get("mode")).items():
 
         opt_conf_for_group = conf.optimizer.get(group_name)
         if opt_conf_for_group is None:
@@ -953,76 +972,6 @@ def get_arg_parser():
         "--print_cfg", action='store_true', help='Print config and exit.'
     )
     return parser
-
-
-def get_conf(args=None):
-    DELIMITER = "=" * 100
-    parser = argparse.ArgumentParser(
-        "IBOT MultiModel training",
-        add_help=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "--config",
-        "-c",
-        nargs="*",
-        default=["conf_new/main_ibot_multimodel.yaml"],
-        help="Path to one or more yaml config files.",
-    )
-    parser.add_argument(
-        "--overrides",
-        "-o",
-        nargs="*",
-        default=[],
-        help="Overrides for the configuration. Should be a dotlist (eg. key.subkey=value).",
-    )
-    parser.add_argument(
-        "--wandb_path", type=str, default=None, help="Path to wandb run to resume."
-    )
-    parser.add_argument(
-        "--resume_wandb",
-        action="store_true",
-        help="If specified, tries to resume the wandb run.",
-    )
-    parser.add_argument(
-        "--help", "-h", action="store_true", help="Show this help message and exit."
-    )
-    
-
-    args = parser.parse_args(args)
-
-    conf = OmegaConf.create({})
-    for conf_path in args.config:
-        conf = OmegaConf.merge(conf, OmegaConf.load(conf_path))
-
-    if args.wandb_path is not None:
-        # resume from wandb
-        api = wandb.Api()
-        run = api.run(args.wandb_path)
-        run_conf = OmegaConf.create(run.config)
-        print(f"{run.id} loaded from wandb.")
-        # copy config
-        conf = OmegaConf.merge(conf, run_conf)
-        if args.resume_wandb:
-            conf.load_from = conf.output_dir
-            conf.wandb.id = run.id
-
-    conf = OmegaConf.merge(conf, OmegaConf.from_dotlist(args.overrides))
-
-    if args.help:
-        print(DELIMITER)
-        parser.print_help()
-        print(DELIMITER)
-        print("Configuration\n", DELIMITER)
-        rich.print(OmegaConf.to_yaml(conf, resolve=False))
-        print(DELIMITER)
-        sys.exit(0)
-    else:
-        print(DELIMITER)
-        rich.print(conf)
-        print(DELIMITER)
-
-    return conf
 
 
 def main():

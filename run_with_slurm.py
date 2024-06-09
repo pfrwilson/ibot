@@ -17,7 +17,7 @@ SLRM_TEMPLATE = """#!/bin/bash
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:{gpus}
 #SBATCH --mem={mem}G
-#SBATCH --qos=m3
+#SBATCH --qos={qos}
 #SBATCH --time=4:00:00
 #SBATCH --signal=B:USR1@240
 #SBATCH --open-mode=append
@@ -59,6 +59,7 @@ def main():
     parser.add_argument('--slrm_gpus', type=int, default=8)
     parser.add_argument('--slrm_job_name', default='ibot')
     parser.add_argument('--slrm_dir', default='.slurm')
+    parser.add_argument('--slrm_qos', default='m3')
 
     args, extras = parser.parse_known_args()
     rich.print(vars(args))
@@ -82,7 +83,8 @@ def main():
             job_name=args.slrm_job_name, 
             gpus=args.slrm_gpus, 
             mem=16*args.slrm_gpus, 
-            bash_file=bash_file
+            bash_file=bash_file,
+            qos=args.slrm_qos,
         ))
     os.system(f'sbatch {slurm_file}')
 
