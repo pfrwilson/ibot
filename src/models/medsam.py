@@ -30,7 +30,13 @@ def build_medsam():
 
 
 class MedSAMIBot(nn.Module):
-    def __init__(self, freeze_pos_embed=False, version="1", n_cls_tokens=1, masked_im_modeling=None):
+    def __init__(
+        self,
+        freeze_pos_embed=False,
+        version="1",
+        n_cls_tokens=1,
+        masked_im_modeling=None,
+    ):
         # keep defaults for now
         super().__init__()
 
@@ -60,14 +66,58 @@ class MedSAMIBot(nn.Module):
     def forward(self, image, mask=None, return_all_tokens=True):
         outputs = self.image_encoder_wrapped(image, mask)
         return outputs
-    
-    def get_feature_map(self, x): 
+
+    def get_feature_map(self, x):
         outputs = self.image_encoder_wrapped(x)
-        outputs = outputs[:, self.n_cls_tokens:, :]
+        outputs = outputs[:, self.n_cls_tokens :, :]
         B = outputs.shape[0]
         H = W = int(outputs.shape[1] ** 0.5)
         outputs = outputs.reshape(B, H, W, -1).permute(0, 3, 1, 2)
         return outputs
+
+
+def interpolate_pos_encoding(x, pos_embed):
+    npatch_in_h = x.shape[1]
+    npatch_in_w = x.shape[2]
+
+    patch_pos_embed = pos_embed
+
+    npatch_native_h = patch_pos_embed.shape[1]
+    npatch_native_w = patch_pos_embed.shape[2]
+
+    if npatch_native_h == npatch_in_h and npatch_native_w == npatch_in_w:
+        return pos_embed
+
+    w0 = npatch_in_w
+    h0 = npatch_in_h
+    # we add a small number to avoid floating point error in the interpolation
+    # see discussion at https://github.com/facebookresearch/dino/issues/8
+    w0, h0 = w0 + 0.1, h0 + 0.1
+    patch_pos_embed = nn.functional.interpolate(
+        patch_pos_embed.permute(0, 3, 1, 2),
+        scale_factor=(h0 / npatch_native_h, w0 / npatch_native_w),
+        mode="bicubic",
+    )
+    assert int(w0) == patch_pos_embed.shape[-2] and int(h0) == patch_pos_embed.shape[-1]
+    patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1)
+    return patch_pos_embed
+
+
+# monkey patching the forward pass of the image encoder to include interpolation
+def image_encoder_forward_with_interpolation(self: ImageEncoderViT, x):
+    x = self.patch_embed(x)
+    if self.pos_embed is not None:
+        x = x + interpolate_pos_encoding(x, self.pos_embed)
+
+    for blk in self.blocks:
+        x = blk(x)
+
+    x = self.neck(x.permute(0, 3, 1, 2))
+
+    return x
+
+
+ImageEncoderViT.forward = image_encoder_forward_with_interpolation
 
 
 class ImageEncoderViTWithClassTokenAndMasking(nn.Module):

@@ -4,7 +4,7 @@ import torch
 
 
 def main(): 
-    parser = ArgumentParser(description="Extract model checkpoint from a training run", formatter_class=ArgumentDefaultsHelpFormatter)
+    parser = ArgumentParser(description="Extract model from a training run checkpoint", formatter_class=ArgumentDefaultsHelpFormatter)
     parser.add_argument('--checkpoint', '-c', type=str, required=True, help="Path to the checkpoint to extract")
     parser.add_argument('--output', '-o', type=str, default='model.pth', help="Path to save the extracted model")
     parser.add_argument('--mode', choices=['main_ibot_multimodel'], default='main_ibot_multimodel', help="Mode to extract the model checkpoint")

@@ -7,7 +7,7 @@ from monai.networks.nets.unetr import (
     UnetrUpBlock,
 )
 from .vision_transformer import VisionTransformer
-from .medsam import Sam
+from .medsam import Sam, interpolate_pos_encoding
 
 
 class UNETR(torch.nn.Module):
@@ -180,16 +180,17 @@ class VITImageEncoderWrapperForUNETR(torch.nn.Module):
 
 
 class SAMWrapperForUNETR(torch.nn.Module): 
-    def __init__(self, sam: Sam):
+    def __init__(self, image_encoder):
         super().__init__()
-        self.image_encoder = sam.image_encoder
-        del self.image_encoder.neck
+        self.image_encoder = image_encoder
+        if hasattr(self.image_encoder, "neck"):
+            del self.image_encoder.neck
 
     def forward(self, x): 
         image_encoder = self.image_encoder
         x = image_encoder.patch_embed(x)
         if image_encoder.pos_embed is not None:
-            x = x + image_encoder.pos_embed
+            x = x + interpolate_pos_encoding(x, image_encoder.pos_embed)
 
         hiddens = []
         for blk in image_encoder.blocks:

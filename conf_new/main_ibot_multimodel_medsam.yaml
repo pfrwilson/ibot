@@ -1,4 +1,4 @@
-output_dir: /checkpoint/${oc.env:USER}/${oc.env:SLURM_JOB_ID}
+output_dir: ${oc.env:OUTPUT_DIR}
 nct_patches_data_path: '/ssd005/projects/exactvu_pca/nct2013_bmode_patches'
 
 wandb:

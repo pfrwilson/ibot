@@ -57,6 +57,10 @@ def compute_binary_classification_metrics(y_score, y_true, log_images=False):
         y_score = y_score.cpu().numpy()
     if isinstance(y_true, torch.Tensor):
         y_true = y_true.cpu().numpy()
+    if isinstance(y_true, list):
+        y_true = np.array(y_true)
+    if isinstance(y_score, list):
+        y_score = np.array(y_score)
 
     if y_score.ndim > 1:
         y_score = y_score[:, -1]

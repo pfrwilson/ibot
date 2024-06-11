@@ -95,6 +95,7 @@ def train_ibot(conf):
     # ========= setup =======================
     os.makedirs(conf.output_dir, exist_ok=True)
     OmegaConf.save(conf, os.path.join(conf.output_dir, "config.yaml"), resolve=True)
+    OmegaConf.save(conf, os.path.join(conf.output_dir, "config-non-resolved.yaml"), resolve=False)
 
     dist.init_process_group(backend="nccl")
     torch.cuda.set_device(dist.get_rank())
@@ -114,6 +115,7 @@ def train_ibot(conf):
             project="iBOT",
             config=OmegaConf.to_container(conf, resolve=True),  # type:ignore
             resume="allow",
+            job_type="ssl_pretraining", 
             **conf.wandb,
         )
     torch.backends.cudnn.benchmark = True
